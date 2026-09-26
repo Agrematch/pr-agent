@@ -326,7 +326,7 @@ MAX_TOKENS = {
     # -- Bedrock Kimi K3 (cross-region) --
     # https://aws.amazon.com/blogs/machine-learning/introducing-kimi-k3-on-amazon-bedrock/
     'bedrock/moonshotai.kimi-k3': 1000000,
-    # 1M context; kept pinned: absent from LiteLLM's bundled cost map
+    # Keep this pinned at 1M context: absent from LiteLLM's bundled cost map
     'bedrock/us.moonshotai.kimi-k3': 1000000,
     'bedrock/global.moonshotai.kimi-k3': 1000000,
     # Register the same models through Bedrock Converse; keep them pinned for the same reason
