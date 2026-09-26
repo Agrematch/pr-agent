@@ -471,6 +471,9 @@ class TestGetMaxTokens:
         "bedrock/moonshotai.kimi-k3",
         "bedrock/us.moonshotai.kimi-k3",
         "bedrock/global.moonshotai.kimi-k3",
+        "bedrock/converse/moonshotai.kimi-k3",
+        "bedrock/converse/us.moonshotai.kimi-k3",
+        "bedrock/converse/global.moonshotai.kimi-k3",
     ])
     def test_bedrock_kimi_k3_model_max_tokens(self, monkeypatch, model):
         fake_settings = type("", (), {

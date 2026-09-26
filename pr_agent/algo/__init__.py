@@ -329,6 +329,10 @@ MAX_TOKENS = {
     # 1M context; kept pinned: absent from LiteLLM's bundled cost map
     'bedrock/us.moonshotai.kimi-k3': 1000000,
     'bedrock/global.moonshotai.kimi-k3': 1000000,
+    # Same models routed through Bedrock Converse; kept pinned for the same reason
+    'bedrock/converse/moonshotai.kimi-k3': 1000000,
+    'bedrock/converse/us.moonshotai.kimi-k3': 1000000,
+    'bedrock/converse/global.moonshotai.kimi-k3': 1000000,
     'groq/moonshotai/kimi-k2-instruct': 131072,
     'groq/deepseek-r1-distill-llama-70b': 128000,
     'groq/llama-3.3-70b-versatile': 128000,
