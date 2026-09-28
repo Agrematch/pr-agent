@@ -57,6 +57,7 @@ from pr_agent.algo.token_budget import AttemptTokenBudget
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import (
     ModelType,
+    _get_fence,
     convert_to_markdown_v2,
     is_value_no,
     load_yaml,
@@ -1311,7 +1312,7 @@ class PRReviewer:
             suggested_fix = reindent_to_line(suggested_fix, head_lines[start_line - 1])
         if suggested_fix == existing_code.rstrip():
             return "", None
-        fence = "````" if "```" in suggested_fix else "```"
+        fence = _get_fence(suggested_fix)
         reason = None
         if fence != "```":
             # providers rewrite suggestion blocks with a ```suggestion.*?``` regex that a nested fence breaks
