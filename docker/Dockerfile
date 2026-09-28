@@ -35,12 +35,6 @@ FROM base AS github_polling
 COPY pr_agent pr_agent
 CMD ["python", "pr_agent/servers/github_polling.py"]
 
-FROM base AS github_action
-COPY pr_agent pr_agent
-COPY github_action/entrypoint.sh /
-RUN chmod +x /entrypoint.sh
-ENTRYPOINT ["/entrypoint.sh"]
-
 FROM base AS gitlab_webhook
 COPY pr_agent pr_agent
 CMD ["python", "-m", "gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-c", "pr_agent/servers/gunicorn_config.py", "--forwarded-allow-ips", "*", "pr_agent.servers.gitlab_webhook:app"]
@@ -83,3 +77,14 @@ FROM base AS cli
 COPY pr_agent pr_agent
 RUN uv sync --frozen --no-dev && ln -s /app/.venv/bin/pr-agent /usr/local/bin/pr-agent
 ENTRYPOINT ["python", "pr_agent/cli.py"]
+
+# Kept last: action.yaml's docker-action `image:` field can't specify a build
+# --target, so `docker build` with no --target resolves to whichever stage is
+# last in the file. Every other consumer (build-and-test.yaml, e2e_tests.yaml,
+# publish.yml, the install docs) passes an explicit --target, so this stage's
+# position is otherwise free to move.
+FROM base AS github_action
+COPY pr_agent pr_agent
+COPY github_action/entrypoint.sh /
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
