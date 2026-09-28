@@ -1818,6 +1818,15 @@ def test_convert_to_markdown_renders_confidence_and_suggested_fix(gfm_supported)
         assert "Suggested fix:" in markdown
 
 
+def test_convert_to_markdown_tags_the_suggested_fix_with_the_file_language():
+    output = {"review": {"key_issues_to_review": [_key_issue(suggested_fix="release(lock)")]}}
+    files = [FilePatchInfo(base_file="", head_file="one\ntwo\n", patch="", filename="app.py")]
+
+    markdown = convert_to_markdown_v2(output, gfm_supported=True, files=files)
+
+    assert "```python\nrelease(lock)\n```" in markdown
+
+
 def test_convert_to_markdown_omits_non_integer_confidence():
     output = {"review": {"key_issues_to_review": [_key_issue(confidence="high")]}}
 

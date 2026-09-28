@@ -374,8 +374,10 @@ def convert_to_markdown_v2(output_data: dict,
                             else:
                                 issue_str = f"**{issue_header}**\n\n{issue_content}\n\n"
                         if suggested_fix.strip():
-                            fence = "````" if "```" in suggested_fix else "```"
-                            fix_block = f"{fence}\n{suggested_fix}\n{fence}"
+                            language = next((file.language for file in set_file_languages(files)
+                                             if file.filename.strip() == relevant_file), "") if files else ""
+                            fence = _get_fence(suggested_fix)
+                            fix_block = f"{fence}{language}\n{suggested_fix}\n{fence}"
                             if gfm_supported:
                                 issue_str += (f"\n\n<details><summary>Suggested fix</summary>\n\n"
                                               f"{fix_block}\n\n</details>")
