@@ -26,7 +26,8 @@ Determining what to flag:
 Constructing comments:
 - Be direct about why something is a problem and the realistic scenario where it manifests.
 - Communicate severity accurately. Do not overstate impact. If an issue only arises under specific inputs or environments, say so upfront.
-- Keep each issue description concise. Write so the reader grasps the point immediately without close reading.
+- Keep each issue description to one to three sentences, so the reader grasps the point immediately without close reading. Busy reviewers skim; extra words hide the finding.
+- Report each problem once. A security problem located in the diff belongs in `key_issues_to_review` (for example as a 'Security Regression'); `security_concerns` then only names it in one line and does not repeat the explanation.
 - Use a matter-of-fact, helpful tone. Avoid accusatory language, excessive praise, or filler phrases like 'Great job', 'Thanks for'.
 
 {%- if skills_context %}
@@ -131,7 +132,7 @@ class Review(BaseModel):
 {%- endif %}
     key_issues_to_review: List[KeyIssuesComponentLink] = Field("A concise list (0-{{ num_max_findings }} issues) of bugs, security vulnerabilities, or significant performance concerns introduced in this PR. Only include issues you are confident about. If confidence is limited but the potential impact is high (e.g., data loss, security), you may include it only if you explicitly note what remains uncertain. Each issue must identify a concrete problem with a realistic trigger scenario. An empty list is acceptable if no clear issues are found.")
 {%- if require_security_review %}
-    security_concerns: str = Field(description="Does this PR code introduce vulnerabilities such as exposure of sensitive information (e.g., API keys, secrets, passwords), or security concerns like SQL injection, XSS, CSRF, and others? Answer 'No' (without explaining why) if there are no possible issues. Answer with the exact English literal 'No', and do not translate it into another language, even if extra instructions ask you to write your response in another language. If there are security concerns or issues, start your answer with a short header, such as: 'Sensitive information exposure: ...', 'SQL injection: ...', etc. Explain your answer. Be specific and give examples if possible")
+    security_concerns: str = Field(description="Does this PR code introduce vulnerabilities such as exposure of sensitive information (e.g., API keys, secrets, passwords), or security concerns like SQL injection, XSS, CSRF, and others? Answer 'No' (without explaining why) if there are no possible issues. Answer with the exact English literal 'No', and do not translate it into another language, even if extra instructions ask you to write your response in another language. If there are security concerns or issues, start your answer with a short header, such as: 'Sensitive information exposure: ...', 'SQL injection: ...', etc. Keep the explanation short and specific. If the concern is already listed in key_issues_to_review, only give its header and point to that issue (e.g., 'SQL injection: see the key issue in `db.py`') instead of repeating it.")
 {%- endif %}
 {%- if require_todo_scan %}
     todo_sections: Union[List[TodoSection], str] = Field(description="A list of TODO comments found in the PR code. Return 'No' (as a string) if there are no TODO comments in the PR")
