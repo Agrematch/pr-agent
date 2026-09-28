@@ -525,7 +525,7 @@ async def test_chat_completion_strips_temperature_for_bedrock_kimi_k3_and_glm5_b
         for model in models:
             await handler.chat_completion(model=model, system="sys", user="usr", temperature=0.2)
 
-    assert [call.kwargs.get("temperature") for call in mock_call.call_args_list] == [None] * len(models)
+    assert all("temperature" not in call.kwargs for call in mock_call.call_args_list)
 
 
 @pytest.mark.asyncio
