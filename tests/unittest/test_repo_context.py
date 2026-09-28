@@ -95,7 +95,7 @@ def test_default_config_ships_agents_md_as_repo_context():
     with open(config_path, "rb") as config_file:
         config = tomllib.load(config_file)
 
-    assert config["config"]["repo_context_files"] == ["AGENTS.md"]
+    assert config["config"]["repo_context_files"] == [["AGENTS.md", "CLAUDE.md", ".kiro/steering/*.md"]]
     # Reading from the default branch is the secure default.
     assert config["config"]["repo_context_from_default_branch"] is True
 
@@ -2069,6 +2069,53 @@ def test_repo_context_cache_key_tracks_glob_limit_only_for_glob_entries(monkeypa
 
     assert repo_context._get_repo_context_cache_key(["docs/adr/*.md"], 500, "ref") != glob_key
     assert repo_context._get_repo_context_cache_key(["AGENTS.md"], 500, "ref") == plain_key
+
+
+AGENT_INSTRUCTION_ALTERNATIVES = ["AGENTS.md", "CLAUDE.md", ".kiro/steering/*.md"]
+
+
+@pytest.mark.parametrize(
+    "files,expected",
+    [
+        ({"AGENTS.md": "agents", "CLAUDE.md": "claude"}, [("AGENTS.md", "agents")]),
+        ({"CLAUDE.md": "claude"}, [("CLAUDE.md", "claude")]),
+        (
+            {".kiro/steering/b.md": "B", ".kiro/steering/a.md": "A"},
+            [(".kiro/steering/a.md", "A"), (".kiro/steering/b.md", "B")],
+        ),
+        ({}, []),
+    ],
+)
+def test_load_repo_context_files_uses_first_available_alternative(files, expected):
+    provider = ListingFakeProvider(files, {".kiro/steering": sorted(files, reverse=True)})
+
+    loaded, had_fetch_error = repo_context._load_repo_context_files(
+        provider, [AGENT_INSTRUCTION_ALTERNATIVES], from_default_branch=True
+    )
+
+    assert loaded == expected
+    assert had_fetch_error is False
+
+
+def test_load_repo_context_files_alternatives_skip_structured_entries_and_duplicates():
+    provider = FakeProvider({"AGENTS.md": "agents", "CLAUDE.md": "claude"})
+
+    loaded, _ = repo_context._load_repo_context_files(
+        provider,
+        ["AGENTS.md", [{"repo_id": "org/other", "file_path": "AGENTS.md"}, "AGENTS.md"], ["CLAUDE.md"]],
+        from_default_branch=True,
+    )
+
+    assert loaded == [("AGENTS.md", "agents"), ("CLAUDE.md", "claude")]
+
+
+def test_repo_context_cache_key_tracks_glob_limit_for_nested_glob_alternatives(monkeypatch):
+    config = get_settings().config
+    monkeypatch.setattr(config, "repo_context_max_glob_matches", 5, raising=False)
+    key = repo_context._get_repo_context_cache_key([AGENT_INSTRUCTION_ALTERNATIVES], 500, "ref")
+    monkeypatch.setattr(config, "repo_context_max_glob_matches", 50, raising=False)
+
+    assert repo_context._get_repo_context_cache_key([AGENT_INSTRUCTION_ALTERNATIVES], 500, "ref") != key
 
 
 def test_load_repo_context_files_rejects_wildcards_in_directory_part():

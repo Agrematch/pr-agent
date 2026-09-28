@@ -82,7 +82,9 @@ def _get_repo_context_cache_key(
         tuple((type(file_path).__name__, str(file_path)) for file_path in context_files),
         max_lines,
         context_ref,
-        _read_max_glob_matches() if any(_is_glob_entry(entry) for entry in context_files) else None,
+        _read_max_glob_matches() if any(
+            _is_glob_entry(path) for entry in context_files for path in (entry if isinstance(entry, list) else [entry])
+        ) else None,
     )
 
 
@@ -315,6 +317,31 @@ def _expand_glob_entries(git_provider, context_files: list, from_default_branch:
     return expanded, had_fetch_error
 
 
+def _load_first_available_alternative(
+    git_provider, alternatives: list, from_default_branch: bool
+) -> tuple[list[tuple[str, str]], bool]:
+    """Load the first alternative of a nested-list entry that yields content.
+
+    Lets one entry name competing agent-instruction conventions (e.g. ["AGENTS.md", "CLAUDE.md",
+    ".kiro/steering/*.md"]), which repositories often keep as copies or symlinks of each other, so
+    only one is sent. A glob alternative counts as found when any of its matches has content.
+    """
+    had_fetch_error = False
+    for alternative in alternatives:
+        if not isinstance(alternative, str):
+            get_logger().warning(
+                "Ignoring repo context alternative: alternatives must be local file paths",
+                artifact={"entry": alternative},
+            )
+            continue
+        files, alternative_had_fetch_error = _load_repo_context_files(
+            git_provider, [alternative], from_default_branch)
+        had_fetch_error = had_fetch_error or alternative_had_fetch_error
+        if files:
+            return files, had_fetch_error
+    return [], had_fetch_error
+
+
 def _load_repo_context_files(
     git_provider, context_files: list, from_default_branch: bool | None = None
 ) -> tuple[list[tuple[str, str]], bool]:
@@ -328,6 +355,13 @@ def _load_repo_context_files(
     sibling_fetch_attempts = 0
     seen_sibling_pairs = set()
     for entry in context_files:
+        if isinstance(entry, list):
+            group_files, group_had_fetch_error = _load_first_available_alternative(
+                git_provider, entry, from_default_branch)
+            had_fetch_error = had_fetch_error or group_had_fetch_error
+            loaded_labels = {label for label, _ in files}
+            files.extend(item for item in group_files if item[0] not in loaded_labels)
+            continue
         repo_id, file_path = _parse_repo_context_file_entry(entry)
         if not file_path:
             if isinstance(entry, str) and not entry.strip():
