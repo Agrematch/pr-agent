@@ -439,6 +439,13 @@ You can list any repository-relative paths. By default the files are read from t
 repo_context_files = ["AGENTS.md", "CLAUDE.md", "docs/conventions.md"]
 ```
 
+To include architecture decision records (ADRs) or other rule files without listing each one, an entry may use a glob in its file name. On GitHub and GitLab the directory is listed and up to 20 matches are included in name order; other providers skip glob entries with a warning. Wildcards are only allowed in the last path segment, so `docs/**/*.md` is not supported. When ADRs or standards files are present, `/review` checks the PR against the rules they state and cites the rule it applies.
+
+```toml
+[config]
+repo_context_files = ["AGENTS.md", "docs/adr/*.md"]
+```
+
 :::note[Which branch the files are read from]
 By default (`repo_context_from_default_branch = true`), instruction files are read from the repository's **default branch** — a single trusted source — so neither the PR nor its target branch can alter the guidance used to review it. This matches how Qodo Merge reads these files.
 

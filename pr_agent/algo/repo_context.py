@@ -1,3 +1,4 @@
+import fnmatch
 import re
 import time
 from collections import OrderedDict
@@ -22,6 +23,9 @@ _DEFAULT_MAX_SIBLING_CONTEXT_FILES = 5
 # API calls. It is intentionally not user-configurable.
 _HARD_MAX_SIBLING_CONTEXT_FILES = 20
 _SIBLING_REPO_SEPARATOR = ":"
+_GLOB_CHARACTERS = ("*", "?", "[")
+# Bounds the file fetches one glob entry can trigger; matches beyond it are dropped in name order.
+_MAX_GLOB_MATCHES = 20
 _REPO_CONTEXT_CACHE_MISS = object()
 _unsupported_repo_context_provider_classes = set()
 
@@ -251,15 +255,62 @@ def _read_max_sibling_context_files() -> int:
     return min(max(0, max_siblings), _HARD_MAX_SIBLING_CONTEXT_FILES)
 
 
+def _is_glob_entry(entry) -> bool:
+    return isinstance(entry, str) and any(character in entry for character in _GLOB_CHARACTERS)
+
+
+def _expand_glob_entries(git_provider, context_files: list, from_default_branch: bool) -> tuple[list, bool]:
+    """Replace local ``dir/*.md``-style entries with the matching file paths, sorted by name.
+
+    Only the file-name part may hold wildcards, so each entry costs one directory listing.
+    Sibling entries are not expanded.
+    """
+    expanded = []
+    had_fetch_error = False
+    for entry in context_files:
+        if not _is_glob_entry(entry):
+            if not (isinstance(entry, str) and entry.strip().lstrip("/") in expanded):
+                expanded.append(entry)
+            continue
+        dir_path, _, name_pattern = entry.strip().lstrip("/").rpartition("/")
+        if any(character in dir_path for character in _GLOB_CHARACTERS) or not name_pattern:
+            get_logger().warning(
+                "Skipping repo context glob: only the file-name part may contain wildcards",
+                artifact={"pattern": entry},
+            )
+            continue
+        try:
+            listed = git_provider.list_repo_directory(dir_path, from_default_branch=from_default_branch)
+        except Exception as e:
+            had_fetch_error = True
+            get_logger().warning(f"Failed to list repo context directory: {dir_path}", artifact={"error": str(e)})
+            continue
+        if listed is None:
+            get_logger().warning(
+                f"{type(git_provider).__name__} cannot list repository directories; skipping repo context glob",
+                artifact={"pattern": entry},
+            )
+            continue
+        matches = sorted(path for path in listed if fnmatch.fnmatchcase(path.rsplit("/", 1)[-1], name_pattern))
+        if len(matches) > _MAX_GLOB_MATCHES:
+            get_logger().warning(
+                f"Repo context glob matched {len(matches)} files; keeping the first {_MAX_GLOB_MATCHES}",
+                artifact={"pattern": entry},
+            )
+            matches = matches[:_MAX_GLOB_MATCHES]
+        expanded.extend(path for path in matches if path not in expanded)
+    return expanded, had_fetch_error
+
+
 def _load_repo_context_files(
     git_provider, context_files: list, from_default_branch: bool | None = None
 ) -> tuple[list[tuple[str, str]], bool]:
     if from_default_branch is None:
         from_default_branch = _read_bool_setting("repo_context_from_default_branch", default=True)
+    context_files, had_fetch_error = _expand_glob_entries(git_provider, context_files, from_default_branch)
     # Ordered (label, content) entries rather than a label-keyed dict: a local path can equal a
     # sibling's rendered label, and a label-keyed mapping would silently drop one of them.
     files = []
-    had_fetch_error = False
     max_siblings = _read_max_sibling_context_files()
     sibling_fetch_attempts = 0
     seen_sibling_pairs = set()

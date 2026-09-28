@@ -704,6 +704,15 @@ class GitProvider(ABC):
     def get_repo_file_content(self, file_path: str, from_default_branch: bool = False):
         return ""
 
+    def list_repo_directory(self, dir_path: str, from_default_branch: bool = False) -> list[str] | None:
+        """Return the repository-relative paths of files directly inside ``dir_path``.
+
+        Repo context uses this to expand single-directory glob entries such as ``docs/adr/*.md``.
+        Returns None when the provider cannot list directories, and an empty list for a missing
+        directory. Transient errors propagate so a failed listing is not cached.
+        """
+        return None
+
     def get_sibling_repo_file_content(self, repo_id: str, file_path: str, from_default_branch: bool = False):
         """Fetch a single file from a sibling repository in the same namespace/owner.
 

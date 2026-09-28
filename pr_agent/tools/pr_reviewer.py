@@ -135,6 +135,30 @@ def _as_bool(value) -> bool:
     return False
 
 
+def _finding_confidence(issue: dict) -> Optional[int]:
+    try:
+        return int(str(issue.get("confidence")).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _python_replacement_compiles(file, start_line: int, end_line: int, replacement: str) -> Optional[bool]:
+    """Return False only when a replacement makes a compiling Python file fail compilation."""
+    if not (file.filename or "").lower().endswith((".py", ".pyi", ".pyw")):
+        return None
+    try:
+        compile(file.head_file, file.filename, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError):
+        return None
+    lines = file.head_file.splitlines()
+    lines[start_line - 1:end_line] = replacement.splitlines()
+    try:
+        compile("\n".join(lines), file.filename, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError):
+        return False
+    return True
+
+
 def _review_failure_comment(error: Exception) -> str:
     """Build an optional deterministic failure explanation from an allowlist of safe messages."""
     if not _as_bool(get_settings().pr_reviewer.get("publish_error_details", False)):
@@ -165,6 +189,7 @@ class PRReviewer:
     prediction_data = None  # merged review dict; None means "parse self.prediction instead"
     review_chunk_count = 1
     review_failed_chunk_count = 0
+    low_confidence_filtered_count = 0
 
     def __init__(self, pr_url: str, is_answer: bool = False, is_auto: bool = False, args: list = None,
                  ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
@@ -223,6 +248,7 @@ class PRReviewer:
             "diff": "",  # empty diff for initial calculation
             "num_pr_files": self.git_provider.get_num_of_files(),
             "num_max_findings": get_settings().pr_reviewer.num_max_findings,
+            "enable_suggested_fixes": _as_bool(get_settings().pr_reviewer.get("enable_suggested_fixes", True)),
             "require_score": get_settings().pr_reviewer.require_score_review,
             "require_tests": get_settings().pr_reviewer.require_tests_review,
             "require_estimate_effort_to_review": get_settings().pr_reviewer.require_estimate_effort_to_review,
@@ -775,6 +801,8 @@ class PRReviewer:
             and current_findings is not None
             # a dropped finding is not an absent one, so this run cannot resolve anything
             and not dropped_findings
+            # neither is a finding suppressed by min_finding_confidence
+            and not self.low_confidence_filtered_count
             and len(current_findings) < max_findings
         )
         result = reconcile_review_findings(
@@ -1066,7 +1094,7 @@ class PRReviewer:
         return load_yaml(prediction.strip(),
                          keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "risk_level:",
                                         "merge_recommendation:", "security_concerns:", "key_issues_to_review:",
-                                        "relevant_file:", "relevant_line:", "suggestion:"],
+                                        "relevant_file:", "relevant_line:", "suggestion:", "suggested_fix:"],
                         first_key='review', last_key='security_concerns')
 
     def _validate_review_schema(self, data: object) -> bool:
@@ -1128,6 +1156,7 @@ class PRReviewer:
         data = self.prediction_data if self.prediction_data is not None else self._load_review_yaml(self.prediction)
         if self.prediction_data is None:
             self._validate_review_schema(data)
+        self._filter_low_confidence_findings(data)
         github_action_output(data, 'review')
 
         if not isinstance(data, dict) or not isinstance(data.get('review'), dict) or not data['review']:
@@ -1259,6 +1288,57 @@ class PRReviewer:
 
         return markdown_text
 
+    def _filter_low_confidence_findings(self, data) -> None:
+        self.low_confidence_filtered_count = 0
+        review = data.get("review") if isinstance(data, dict) else None
+        issues = review.get("key_issues_to_review") if isinstance(review, dict) else None
+        if not isinstance(issues, list):
+            return
+        try:
+            threshold = int(get_settings().pr_reviewer.get("min_finding_confidence", 0))
+        except (TypeError, ValueError):
+            threshold = 0
+        if threshold <= 0:
+            return
+        kept = []
+        for issue in issues:
+            confidence = _finding_confidence(issue) if isinstance(issue, dict) else None
+            if confidence is not None and confidence < threshold:
+                continue
+            kept.append(issue)
+        self.low_confidence_filtered_count = len(issues) - len(kept)
+        if self.low_confidence_filtered_count:
+            get_logger().info(f"Dropped {self.low_confidence_filtered_count} finding(s) below "
+                              f"min_finding_confidence={threshold}")
+            review["key_issues_to_review"] = kept
+
+    def _suggested_fix_markdown(self, issue: dict, file, start_line: int, end_line: int) -> tuple[str, dict | None]:
+        """Render a finding's suggested fix, and the provider payload when it is committable."""
+        suggested_fix = issue.get("suggested_fix")
+        enabled = _as_bool(get_settings().pr_reviewer.get("enable_suggested_fixes", True))
+        if not enabled or not isinstance(suggested_fix, str):
+            return "", None
+        suggested_fix = suggested_fix.rstrip()
+        if not suggested_fix.strip():
+            return "", None
+        existing_code = "\n".join(file.head_file.splitlines()[start_line - 1:end_line])
+        if suggested_fix == existing_code.rstrip():
+            return "", None
+        fence = "````" if "```" in suggested_fix else "```"
+        reason = None
+        if not getattr(file, "head_file_is_complete", True):
+            reason = "the file content could not be verified"
+        elif _python_replacement_compiles(file, start_line, end_line, suggested_fix) is False:
+            reason = "the proposed Python code has invalid syntax"
+        if reason:
+            return (f"\n\nProposed fix (not offered as a committable change because {reason}):\n"
+                    f"{fence}\n{suggested_fix}\n{fence}"), None
+        payload = {"relevant_lines_start": start_line, "relevant_lines_end": end_line,
+                   "existing_code": existing_code, "improved_code": suggested_fix,
+                   "suggestion_content": (issue.get("issue_content") or "").strip(),
+                   "label": (issue.get("issue_header") or "").strip()}
+        return f"\n\n{fence}suggestion\n{suggested_fix}\n{fence}", payload
+
     def _build_key_issue_comment(self, issue, diff_files: dict) -> Optional[dict]:
         if not isinstance(issue, dict):
             return None
@@ -1292,11 +1372,15 @@ class PRReviewer:
 
         relevant_file = file.filename.strip()
         body = f"**{issue_header}**\n\n{issue_content}" if issue_header else issue_content
-        return {"body": body,
-                "relevant_file": relevant_file,
-                "relevant_lines_start": start_line,
-                "relevant_lines_end": end_line,
-                "fallback_to_pr_comment": False}
+        fix_markdown, original_suggestion = self._suggested_fix_markdown(issue, file, start_line, end_line)
+        comment = {"body": body + fix_markdown,
+                   "relevant_file": relevant_file,
+                   "relevant_lines_start": start_line,
+                   "relevant_lines_end": end_line,
+                   "fallback_to_pr_comment": False}
+        if original_suggestion is not None:
+            comment["original_suggestion"] = original_suggestion
+        return comment
 
     def _can_verify_inline_key_issue_publication(self) -> bool:
         return can_verify_inline_comment_publication(self.git_provider)
