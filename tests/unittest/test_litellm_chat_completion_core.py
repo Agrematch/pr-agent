@@ -497,9 +497,9 @@ async def test_chat_completion_strips_temperature_for_config_no_temperature_mode
 
 
 @pytest.mark.asyncio
-async def test_chat_completion_strips_temperature_for_bedrock_kimi_k3_by_default(monkeypatch):
-    """Bedrock rejects temperature for Kimi K3, so the shipped defaults must drop it for every
-    inference-profile and Converse spelling."""
+async def test_chat_completion_strips_temperature_for_bedrock_kimi_k3_and_glm5_by_default(monkeypatch):
+    """Verify the shipped defaults drop temperature for every Kimi K3 and GLM-5 inference-profile
+    and Converse spelling, since Bedrock rejects temperature for both."""
     import tomllib
     from pathlib import Path
 
@@ -515,8 +515,9 @@ async def test_chat_completion_strips_temperature_for_bedrock_kimi_k3_by_default
         "_litellm_supports_temperature",
         staticmethod(lambda model, custom_llm_provider=None: True),
     )
-    models = [f"bedrock/{route}{profile}moonshotai.kimi-k3"
-              for route in ("", "converse/") for profile in ("", "us.", "global.")]
+    models = [f"bedrock/{route}{profile}{bare}"
+              for route in ("", "converse/") for profile in ("", "us.", "global.")
+              for bare in ("moonshotai.kimi-k3", "zai.glm-5")]
 
     with patch("pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion", new_callable=AsyncMock) as mock_call:
         mock_call.return_value = _mock_response()
