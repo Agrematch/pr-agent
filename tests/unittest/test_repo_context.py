@@ -2046,13 +2046,29 @@ def test_load_repo_context_files_expands_single_directory_glob():
     assert provider.listed_dirs == [("docs/adr", True)]
 
 
-def test_load_repo_context_files_caps_glob_matches():
-    listed = [f"adr/{index:03}.md" for index in range(30)]
+@pytest.mark.parametrize("configured,expected", [(None, 20), (5, 5), (500, 100), ("bad", 20), (-3, 0)])
+def test_load_repo_context_files_caps_glob_matches(monkeypatch, configured, expected):
+    if configured is not None:
+        monkeypatch.setattr(get_settings().config, "repo_context_max_glob_matches", configured, raising=False)
+    else:
+        monkeypatch.delattr(get_settings().config, "repo_context_max_glob_matches", raising=False)
+    listed = [f"adr/{index:03}.md" for index in range(150)]
     provider = ListingFakeProvider({path: path for path in listed}, {"adr": listed})
 
     files, _ = repo_context._load_repo_context_files(provider, ["adr/*.md"], from_default_branch=True)
 
-    assert [label for label, _ in files] == listed[:repo_context._MAX_GLOB_MATCHES]
+    assert [label for label, _ in files] == listed[:expected]
+
+
+def test_repo_context_cache_key_tracks_glob_limit_only_for_glob_entries(monkeypatch):
+    config = get_settings().config
+    monkeypatch.setattr(config, "repo_context_max_glob_matches", 5, raising=False)
+    glob_key = repo_context._get_repo_context_cache_key(["docs/adr/*.md"], 500, "ref")
+    plain_key = repo_context._get_repo_context_cache_key(["AGENTS.md"], 500, "ref")
+    monkeypatch.setattr(config, "repo_context_max_glob_matches", 50, raising=False)
+
+    assert repo_context._get_repo_context_cache_key(["docs/adr/*.md"], 500, "ref") != glob_key
+    assert repo_context._get_repo_context_cache_key(["AGENTS.md"], 500, "ref") == plain_key
 
 
 def test_load_repo_context_files_rejects_wildcards_in_directory_part():

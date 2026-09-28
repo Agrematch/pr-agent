@@ -24,8 +24,10 @@ _DEFAULT_MAX_SIBLING_CONTEXT_FILES = 5
 _HARD_MAX_SIBLING_CONTEXT_FILES = 20
 _SIBLING_REPO_SEPARATOR = ":"
 _GLOB_CHARACTERS = ("*", "?", "[")
-# Bounds the file fetches one glob entry can trigger; matches beyond it are dropped in name order.
-_MAX_GLOB_MATCHES = 20
+_DEFAULT_MAX_GLOB_MATCHES = 20
+# Ceiling for repo_context_max_glob_matches: each match is one file fetch, and a repository's
+# .pr_agent.toml may set the value.
+_HARD_MAX_GLOB_MATCHES = 100
 _REPO_CONTEXT_CACHE_MISS = object()
 _unsupported_repo_context_provider_classes = set()
 
@@ -75,11 +77,12 @@ def _get_markdown_fence(content: str) -> str:
 
 def _get_repo_context_cache_key(
     context_files: list, max_lines: int, context_ref: str | None
-) -> tuple[tuple[tuple[str, str], ...], int, str | None]:
+) -> tuple[tuple[tuple[str, str], ...], int, str | None, int | None]:
     return (
         tuple((type(file_path).__name__, str(file_path)) for file_path in context_files),
         max_lines,
         context_ref,
+        _read_max_glob_matches() if any(_is_glob_entry(entry) for entry in context_files) else None,
     )
 
 
@@ -255,6 +258,14 @@ def _read_max_sibling_context_files() -> int:
     return min(max(0, max_siblings), _HARD_MAX_SIBLING_CONTEXT_FILES)
 
 
+def _read_max_glob_matches() -> int:
+    try:
+        max_matches = int(get_settings().config.get("repo_context_max_glob_matches", _DEFAULT_MAX_GLOB_MATCHES))
+    except (TypeError, ValueError):
+        max_matches = _DEFAULT_MAX_GLOB_MATCHES
+    return min(max(0, max_matches), _HARD_MAX_GLOB_MATCHES)
+
+
 def _is_glob_entry(entry) -> bool:
     return isinstance(entry, str) and any(character in entry for character in _GLOB_CHARACTERS)
 
@@ -267,6 +278,7 @@ def _expand_glob_entries(git_provider, context_files: list, from_default_branch:
     """
     expanded = []
     had_fetch_error = False
+    max_matches = _read_max_glob_matches()
     for entry in context_files:
         if not _is_glob_entry(entry):
             if not (isinstance(entry, str) and entry.strip().lstrip("/") in expanded):
@@ -292,12 +304,13 @@ def _expand_glob_entries(git_provider, context_files: list, from_default_branch:
             )
             continue
         matches = sorted(path for path in listed if fnmatch.fnmatchcase(path.rsplit("/", 1)[-1], name_pattern))
-        if len(matches) > _MAX_GLOB_MATCHES:
+        if len(matches) > max_matches:
             get_logger().warning(
-                f"Repo context glob matched {len(matches)} files; keeping the first {_MAX_GLOB_MATCHES}",
+                f"Repo context glob matched {len(matches)} files; keeping the first {max_matches} "
+                "(config.repo_context_max_glob_matches)",
                 artifact={"pattern": entry},
             )
-            matches = matches[:_MAX_GLOB_MATCHES]
+            matches = matches[:max_matches]
         expanded.extend(path for path in matches if path not in expanded)
     return expanded, had_fetch_error
 

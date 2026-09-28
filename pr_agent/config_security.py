@@ -66,9 +66,10 @@ REPO_HOST_ONLY_KEYS_BY_SECTION = {
 # commenter must not be able to point the bot at arbitrary sibling repo content. Values curated
 # by the repo's maintainers in .pr_agent.toml stay accepted (apply_repo_settings does not consult
 # this map); only CliArgs.validate_user_args enforces it, so repo settings and comment args do
-# not drift.
+# not drift. repo_context_max_glob_matches bounds how many files those entries fetch, so it
+# follows the same rule.
 CLI_HOST_ONLY_KEYS_BY_SECTION = {
-    "config": frozenset({"repo_context_files"}),
+    "config": frozenset({"repo_context_files", "repo_context_max_glob_matches"}),
 }
 
 # Keys a per-directory `.pr_agent.toml` can never override, even when their section is
