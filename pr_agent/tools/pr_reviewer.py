@@ -65,6 +65,7 @@ from pr_agent.git_providers import get_git_provider_with_context
 from pr_agent.git_providers.git_provider import GitProvider, IncrementalPR, get_main_pr_language
 from pr_agent.log import get_logger
 from pr_agent.servers.help import HelpMessage
+from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
 from pr_agent.tools.ticket_pr_compliance_check import (
     extract_and_cache_pr_tickets,
     fit_related_tickets_to_prompt_budget,
@@ -137,9 +138,19 @@ def _as_bool(value) -> bool:
 
 def _finding_confidence(issue: dict) -> Optional[int]:
     try:
-        return int(str(issue.get("confidence")).strip())
-    except (TypeError, ValueError):
+        return int(float(str(issue.get("confidence")).strip()))
+    except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _reindent_like(code: str, original_initial_line: str) -> str:
+    """Re-indent a YAML block-scalar fix, whose common indentation was stripped, to the replaced lines."""
+    suggested_initial_line = next((line for line in code.splitlines() if line.strip()), "")
+    original_spaces = len(original_initial_line) - len(original_initial_line.lstrip())
+    suggested_spaces = len(suggested_initial_line) - len(suggested_initial_line.lstrip())
+    if original_initial_line.startswith("\t"):
+        return PRCodeSuggestions._align_code_with_tabs(code, original_initial_line[:original_spaces])
+    return PRCodeSuggestions._shift_code_indentation(code, original_spaces - suggested_spaces)
 
 
 def _python_replacement_compiles(file, start_line: int, end_line: int, replacement: str) -> Optional[bool]:
@@ -1321,7 +1332,10 @@ class PRReviewer:
         suggested_fix = suggested_fix.rstrip()
         if not suggested_fix.strip():
             return "", None
-        existing_code = "\n".join(file.head_file.splitlines()[start_line - 1:end_line])
+        head_lines = file.head_file.splitlines()
+        existing_code = "\n".join(head_lines[start_line - 1:end_line])
+        if 0 < start_line <= len(head_lines):
+            suggested_fix = _reindent_like(suggested_fix, head_lines[start_line - 1])
         if suggested_fix == existing_code.rstrip():
             return "", None
         fence = "````" if "```" in suggested_fix else "```"

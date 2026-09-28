@@ -1745,12 +1745,42 @@ def test_key_issue_suggested_fix_containing_a_fence_is_not_committable(suggested
 
 
 @pytest.mark.parametrize(
+    "head_file,expected_fix",
+    [
+        ("def f():\n    if x:\n        return 1\n", "    if x is not None:\n        return 1"),
+        ("def f():\n\tif x:\n\t\treturn 1\n", "\tif x is not None:\n\t\treturn 1"),
+    ],
+)
+def test_key_issue_suggested_fix_is_reindented_to_the_replaced_lines(suggested_fixes_enabled, head_file, expected_fix):
+    # YAML block scalars strip the common indentation of the model's fix
+    issue = _key_issue(start_line=2, end_line=3, suggested_fix="if x is not None:\n    return 1")
+    reviewer, data = _reviewer_with_findings(issue, head_file=head_file)
+
+    reviewer._publish_key_issues_as_inline_comments(data)
+
+    comment = _published_comment(reviewer.git_provider)
+    assert f"```suggestion\n{expected_fix}\n```" in comment["body"]
+    assert comment["original_suggestion"]["improved_code"] == expected_fix
+
+
+def test_key_issue_suggested_fix_equal_to_the_code_after_reindenting_has_no_fix_block(suggested_fixes_enabled):
+    issue = _key_issue(start_line=2, end_line=3, suggested_fix="if x:\n    return 1")
+    reviewer, data = _reviewer_with_findings(issue, head_file="def f():\n    if x:\n        return 1\n")
+
+    reviewer._publish_key_issues_as_inline_comments(data)
+
+    comment = _published_comment(reviewer.git_provider)
+    assert "```" not in comment["body"]
+    assert "original_suggestion" not in comment
+
+
+@pytest.mark.parametrize(
     "threshold,expected_contents,expected_dropped",
     [
-        (0, ["high", "low", "none", "string", "garbage"], 0),
-        (60, ["high", "none", "string", "garbage"], 1),
-        (80, ["high", "none", "garbage"], 2),
-        ("not-a-number", ["high", "low", "none", "string", "garbage"], 0),
+        (0, ["high", "low", "none", "string", "garbage", "float", "float-string"], 0),
+        (60, ["high", "none", "string", "garbage", "float-string"], 2),
+        (80, ["high", "none", "garbage", "float-string"], 3),
+        ("not-a-number", ["high", "low", "none", "string", "garbage", "float", "float-string"], 0),
     ],
 )
 def test_filter_low_confidence_findings(monkeypatch, threshold, expected_contents, expected_dropped):
@@ -1762,6 +1792,8 @@ def test_filter_low_confidence_findings(monkeypatch, threshold, expected_content
         _key_issue(issue_content="none"),
         _key_issue(issue_content="string", confidence=" 70 "),
         _key_issue(issue_content="garbage", confidence="very"),
+        _key_issue(issue_content="float", confidence=59.9),
+        _key_issue(issue_content="float-string", confidence="85.0"),
     ]}}
 
     reviewer._filter_low_confidence_findings(data)
