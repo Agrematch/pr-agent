@@ -1731,14 +1731,17 @@ def test_key_issue_suggested_fix_is_ignored_when_disabled(monkeypatch):
     assert "original_suggestion" not in comment
 
 
-def test_key_issue_suggested_fix_containing_a_fence_uses_a_longer_fence(suggested_fixes_enabled):
+def test_key_issue_suggested_fix_containing_a_fence_is_not_committable(suggested_fixes_enabled):
     fix = 'doc = """\n```\nexample\n```\n"""'
     issue = _key_issue(start_line=2, end_line=2, suggested_fix=fix)
     reviewer, data = _reviewer_with_findings(issue)
 
     reviewer._publish_key_issues_as_inline_comments(data)
 
-    assert f"````suggestion\n{fix}\n````" in _published_comment(reviewer.git_provider)["body"]
+    comment = _published_comment(reviewer.git_provider)
+    assert "suggestion\n" not in comment["body"]
+    assert f"````\n{fix}\n````" in comment["body"]
+    assert "original_suggestion" not in comment
 
 
 @pytest.mark.parametrize(

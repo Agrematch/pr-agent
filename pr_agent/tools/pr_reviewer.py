@@ -1326,7 +1326,10 @@ class PRReviewer:
             return "", None
         fence = "````" if "```" in suggested_fix else "```"
         reason = None
-        if not getattr(file, "head_file_is_complete", True):
+        if fence != "```":
+            # providers rewrite suggestion blocks with a ```suggestion.*?``` regex that a nested fence breaks
+            reason = "the code contains a Markdown code fence"
+        elif not file.head_file_is_complete:
             reason = "the file content could not be verified"
         elif _python_replacement_compiles(file, start_line, end_line, suggested_fix) is False:
             reason = "the proposed Python code has invalid syntax"
