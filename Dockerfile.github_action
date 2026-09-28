@@ -1,0 +1,27 @@
+# Throwaway duplicate of docker/Dockerfile's base+github_action stages, kept
+# only on this testing branch. A docker-action `image:` field always uses the
+# Dockerfile's own directory as the build context (see the failed build in
+# https://github.com/Agrematch/chembook/actions/runs/36427164005), so pointing
+# action.yaml at docker/Dockerfile directly loses repo-root files like
+# pr_agent/, uv.lock, and github_action/entrypoint.sh. This file exists purely
+# so the context resolves to the repo root; not intended to be merged upstream.
+FROM python:3.14.7-slim AS base
+COPY --from=ghcr.io/astral-sh/uv:0.12.10 /uv /uvx /bin/
+
+ENV LITELLM_LOCAL_MODEL_COST_MAP=True
+
+RUN apt-get update && apt-get install --no-install-recommends -y git curl && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+ENV UV_COMPILE_BYTECODE=1
+COPY pyproject.toml uv.lock ./
+COPY docs docs
+RUN uv sync --frozen --no-install-project --no-dev
+ENV PATH="/app/.venv/bin:$PATH"
+ENV PYTHONPATH=/app
+
+FROM base AS github_action
+COPY pr_agent pr_agent
+COPY github_action/entrypoint.sh /
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
