@@ -40,6 +40,7 @@ Specific guidelines for generating code suggestions:
 {%- endif %}
 - If the suggested `improved_code` introduces a dependency, include the import needed to make that suggestion valid. Do not suggest unrelated or standalone missing imports.
 - Be aware that your input consists only of partial code segments (PR diff code), not the complete codebase. Therefore, avoid making suggestions that might duplicate existing functionality, and refrain from questioning code elements (such as variable declarations or import statements) that may be defined elsewhere in the codebase.
+- When a suggestion depends on a specific field name, method name, attribute path, or API shape (e.g. an event payload attribute, a function signature, an import path), only assert one that is literally visible in the provided diff or file content. Do not invent or guess a plausible-looking name from general knowledge of a similar API. If you are not certain the exact name is correct from what you can see, phrase the suggestion as "verify the correct field/method name" rather than stating it as fact, or omit the suggestion.
 - When mentioning code elements (variables, names, or files) in your response, surround them with backticks (`). For example: "verify that `user_id` is..."
 
 {%- if extra_instructions %}
