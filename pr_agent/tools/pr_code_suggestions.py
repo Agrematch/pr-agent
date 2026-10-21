@@ -1413,6 +1413,7 @@ class PRCodeSuggestions:
         artifact_suggestions = []
         fallback_comments = []
         artifact_batch_published = False
+        is_successful = False
         coverage_footer = self._get_suggestions_coverage_footer() if include_coverage_footer else ""
         supports_suggestions_artifact = self.git_provider.supports_code_suggestions_artifact() is True
 
