@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -93,8 +93,8 @@ class TestCodeCommitProvider:
         comment = {
             "commentId": comment_id,
             "content": body,
-            "creationDate": created_at or datetime(2024, 1, 1, tzinfo=timezone.utc),
-            "lastModifiedDate": last_modified_at or created_at or datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "creationDate": created_at or datetime(2024, 1, 1, tzinfo=UTC),
+            "lastModifiedDate": last_modified_at or created_at or datetime(2024, 1, 1, tzinfo=UTC),
             "authorArn": "arn:aws:iam::123456789012:user/pr-agent",
         }
         comment.update(overrides)
@@ -168,7 +168,7 @@ class TestCodeCommitProvider:
             ),
         ],
     )
-    def test_get_diff_files_skips_non_utf8_file_and_keeps_utf8_sibling(
+    def test_get_diff_files_marks_non_utf8_file_unreadable_and_keeps_utf8_sibling(
         self,
         non_utf8_file,
         invalid_path,
@@ -186,18 +186,23 @@ class TestCodeCommitProvider:
 
         diff_files = provider.get_diff_files()
 
-        assert [diff_file.filename for diff_file in diff_files] == ["good.py"]
-        assert diff_files[0].base_file == "before\n"
-        assert diff_files[0].head_file == "after\n"
-        assert "-before" in diff_files[0].patch
-        assert "+after" in diff_files[0].patch
-        assert diff_files[0].edit_type == EDIT_TYPE.MODIFIED
+        assert [diff_file.filename for diff_file in diff_files] == [non_utf8_file.filename, "good.py"]
+        assert diff_files[0].content_fetch_failed is True
+        assert diff_files[0].patch == ""
+        assert diff_files[0].base_file == diff_files[0].head_file == ""
+        assert diff_files[0].edit_type == non_utf8_file.edit_type
+        assert diff_files[1].base_file == "before\n"
+        assert diff_files[1].head_file == "after\n"
+        assert "-before" in diff_files[1].patch
+        assert "+after" in diff_files[1].patch
+        assert diff_files[1].edit_type == EDIT_TYPE.MODIFIED
         assert provider.diff_files is diff_files
 
     def test_get_diff_files_filters_invalid_extension_before_fetching_content(self):
         ignored_file = CodeCommitFile("image.png", "before-id", "image.png", "after-id", EDIT_TYPE.MODIFIED)
+        lockfile = CodeCommitFile("pnpm-lock.yaml", "before-id", "pnpm-lock.yaml", "after-id", EDIT_TYPE.MODIFIED)
         valid_file = CodeCommitFile("good.py", "before-id", "good.py", "after-id", EDIT_TYPE.MODIFIED)
-        provider = self._make_diff_provider([ignored_file, valid_file])
+        provider = self._make_diff_provider([ignored_file, lockfile, valid_file])
         provider.codecommit_client.get_file.side_effect = (
             lambda _repo_name, _path, commit: b"before\n" if commit == "destination-commit" else b"after\n"
         )
@@ -205,6 +210,7 @@ class TestCodeCommitProvider:
         diff_files = provider.get_diff_files()
 
         assert [diff_file.filename for diff_file in diff_files] == ["good.py"]
+        assert provider.get_filtered_diff_file_names() == ["image.png", "pnpm-lock.yaml"]
         assert provider.codecommit_client.get_file.call_args_list == [
             call("my_test_repo", "good.py", "destination-commit"),
             call("my_test_repo", "good.py", "source-commit"),
@@ -229,6 +235,7 @@ class TestCodeCommitProvider:
             diff_files = provider.get_diff_files()
 
         assert [diff_file.filename for diff_file in diff_files] == ["good.py"]
+        assert provider.get_filtered_diff_file_names() == []
         assert provider.codecommit_client.get_file.call_args_list == [
             call("my_test_repo", "good.py", "destination-commit"),
             call("my_test_repo", "good.py", "source-commit"),
@@ -342,7 +349,8 @@ class TestCodeCommitProvider:
             optional=True,
         )
 
-    def test_get_files_includes_differences_from_every_pull_request_target(self):
+    @pytest.mark.parametrize("fail_second_target", [False, True])
+    def test_get_files_includes_differences_from_every_pull_request_target(self, fail_second_target):
         provider = object.__new__(CodeCommitProvider)
         provider.repo_name = "source-repository"
         provider.pr_num = 321
@@ -410,7 +418,18 @@ class TestCodeCommitProvider:
         provider.codecommit_client.get_differences.side_effect = get_differences
 
         provider.pr = provider._get_pr()
+        if fail_second_target:
+            provider.codecommit_client.get_differences.side_effect = [
+                differences_by_repository["source-repository"],
+                ValueError("second target failed"),
+            ]
+            with pytest.raises(ValueError, match="second target failed"):
+                provider.get_files()
+            assert provider.git_files is None
+            provider.codecommit_client.get_differences.side_effect = get_differences
+
         files = provider.get_files()
+        assert provider.get_files() is files
 
         assert [target.repository_name for target in provider.pr.targets] == [
             "source-repository", "destination-repository"
@@ -426,7 +445,7 @@ class TestCodeCommitProvider:
         assert provider.codecommit_client.get_differences.call_args_list == [
             call("source-repository", "merge-base-1", "source-commit-1"),
             call("destination-repository", "merge-base-2", "source-commit-2"),
-        ]
+        ] * (2 if fail_second_target else 1)
 
         provider.codecommit_client.get_file.side_effect = (
             lambda repository, path, commit: {
@@ -443,7 +462,7 @@ class TestCodeCommitProvider:
             ("two.py", "before two\n", "after two\n"),
         ]
 
-    def test_get_files_falls_back_to_destination_when_merge_base_is_missing(self):
+    def test_get_files_caches_empty_result_with_destination_fallback(self):
         provider = object.__new__(CodeCommitProvider)
         provider.repo_name = "source-repository"
         provider.git_files = None
@@ -459,6 +478,8 @@ class TestCodeCommitProvider:
         provider.pr.source_commit = target.source_commit
         provider.pr.destination_commit = target.destination_commit
 
+        assert provider.get_languages() == {}
+        assert provider.get_files() == []
         assert provider.get_files() == []
         provider.codecommit_client.get_differences.assert_called_once_with(
             "source-repository", "destination-commit", "source-commit"
@@ -783,7 +804,7 @@ class TestCodeCommitProvider:
                 self._comment(
                     existing_body,
                     comment_id="target-b-old",
-                    created_at=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                    created_at=datetime(2024, 1, 2, tzinfo=UTC),
                 ),
                 before_commit_id="shared-destination-commit",
                 after_commit_id="source-commit-b-old",
@@ -792,7 +813,7 @@ class TestCodeCommitProvider:
                 self._comment(
                     existing_body,
                     comment_id="target-a-old",
-                    created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                    created_at=datetime(2024, 1, 1, tzinfo=UTC),
                 ),
                 before_commit_id="shared-destination-commit",
                 after_commit_id="source-commit-a-old",
@@ -820,13 +841,13 @@ class TestCodeCommitProvider:
             "old": self._comment(
                 "older answer",
                 comment_id="old-comment",
-                created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
-                last_modified_at=datetime(2024, 1, 10, tzinfo=timezone.utc),
+                created_at=datetime(2024, 1, 1, tzinfo=UTC),
+                last_modified_at=datetime(2024, 1, 10, tzinfo=UTC),
             ),
             "new": self._comment(
                 "newer answer",
                 comment_id="new-comment",
-                created_at=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                created_at=datetime(2024, 1, 2, tzinfo=UTC),
             ),
         }
         provider.codecommit_client.get_comments_for_pull_request.return_value = [
@@ -851,10 +872,10 @@ class TestCodeCommitProvider:
             "a-new": "/answer new answer",
         }
         dates_by_name = {
-            "q-old": datetime(2024, 1, 1, tzinfo=timezone.utc),
-            "a-old": datetime(2024, 1, 2, tzinfo=timezone.utc),
-            "q-new": datetime(2024, 1, 3, tzinfo=timezone.utc),
-            "a-new": datetime(2024, 1, 4, tzinfo=timezone.utc),
+            "q-old": datetime(2024, 1, 1, tzinfo=UTC),
+            "a-old": datetime(2024, 1, 2, tzinfo=UTC),
+            "q-new": datetime(2024, 1, 3, tzinfo=UTC),
+            "a-new": datetime(2024, 1, 4, tzinfo=UTC),
         }
         provider.codecommit_client.get_comments_for_pull_request.return_value = [
             self._comment_group(
@@ -886,13 +907,13 @@ class TestCodeCommitProvider:
             "old": self._comment(
                 body,
                 comment_id="old-comment",
-                created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
-                last_modified_at=datetime(2024, 1, 10, tzinfo=timezone.utc),
+                created_at=datetime(2024, 1, 1, tzinfo=UTC),
+                last_modified_at=datetime(2024, 1, 10, tzinfo=UTC),
             ),
             "new": self._comment(
                 body,
                 comment_id="new-comment",
-                created_at=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                created_at=datetime(2024, 1, 2, tzinfo=UTC),
             ),
         }
         provider.codecommit_client.get_comments_for_pull_request.return_value = [
@@ -931,7 +952,7 @@ class TestCodeCommitProvider:
                 self._comment(
                     "valid new",
                     comment_id="valid-new",
-                    created_at=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                    created_at=datetime(2024, 1, 2, tzinfo=UTC),
                 )
             ),
         ]
@@ -1153,6 +1174,110 @@ class TestCodeCommitProvider:
         assert result is False
         assert provider.codecommit_client.publish_comment.called
 
+    def test_publish_code_suggestions_prepares_markdown_and_html(self):
+        provider = object.__new__(CodeCommitProvider)
+        provider.repo_name = "source-repository"
+        provider.pr_num = 321
+        provider.codecommit_client = MagicMock()
+        provider._get_target_contexts_for_file = MagicMock(return_value=[{
+            "repository_name": "source-repository",
+            "destination_commit": "destination-commit-1",
+            "source_commit": "source-commit-1",
+        }])
+
+        result = provider.publish_code_suggestions([
+            {
+                "body": "<details><summary>Suggestion</summary>\nLine 1\nLine 2</details>",
+                "relevant_file": "one.py",
+                "relevant_lines_start": 10,
+            }
+        ])
+
+        assert result is True
+        provider.codecommit_client.publish_comment.assert_called_once_with(
+            repo_name="source-repository",
+            pr_number=321,
+            destination_commit="destination-commit-1",
+            source_commit="source-commit-1",
+            comment="Suggestion\n\nLine 1\n\nLine 2",
+            annotation_file="one.py",
+            annotation_line=10,
+        )
+
+    def test_publish_code_suggestions_preserves_multiline_code_fence(self):
+        provider = object.__new__(CodeCommitProvider)
+        provider.repo_name = "source-repository"
+        provider.pr_num = 321
+        provider.codecommit_client = MagicMock()
+        provider._get_target_contexts_for_file = MagicMock(return_value=[{
+            "repository_name": "source-repository",
+            "destination_commit": "destination-commit-1",
+            "source_commit": "source-commit-1",
+        }])
+
+        result = provider.publish_code_suggestions([
+            {
+                "body": (
+                    "<details><summary>Suggestion</summary>\n"
+                    "```suggestion\n"
+                    "def calculate(a, b):\n"
+                    "    res = a + b\n"
+                    "    return res\n"
+                    "```\n"
+                    "Explanation line 1\n"
+                    "Explanation line 2</details>"
+                ),
+                "relevant_file": "math_ops.py",
+                "relevant_lines_start": 42,
+            }
+        ])
+
+        assert result is True
+        expected_comment = (
+            "Suggestion\n\n"
+            "```suggestion\n"
+            "def calculate(a, b):\n"
+            "    res = a + b\n"
+            "    return res\n"
+            "```\n\n"
+            "Explanation line 1\n\n"
+            "Explanation line 2"
+        )
+        provider.codecommit_client.publish_comment.assert_called_once_with(
+            repo_name="source-repository",
+            pr_number=321,
+            destination_commit="destination-commit-1",
+            source_commit="source-commit-1",
+            comment=expected_comment,
+            annotation_file="math_ops.py",
+            annotation_line=42,
+        )
+
+    def test_publish_code_suggestions_sends_capped_body(self):
+        provider = object.__new__(CodeCommitProvider)
+        provider.repo_name = "source-repository"
+        provider.pr_num = 321
+        provider.codecommit_client = MagicMock()
+        provider._get_target_contexts_for_file = MagicMock(return_value=[{
+            "repository_name": "source-repository",
+            "destination_commit": "destination-commit-1",
+            "source_commit": "source-commit-1",
+        }])
+
+        result = provider.publish_code_suggestions([
+            {
+                "body": "\n".join(["x" * 100] * 120),
+                "relevant_file": "one.py",
+                "relevant_lines_start": 5,
+            }
+        ])
+
+        assert result is True
+        sent = provider.codecommit_client.publish_comment.call_args.kwargs["comment"]
+        assert len(sent) <= 10240
+        assert sent.endswith("...")
+        assert "\n\n" in sent
+
     def test_get_title(self):
         # Test that the get_title() function returns the PR title
         with patch.object(CodeCommitProvider, "__init__", lambda x, y: None):
@@ -1372,6 +1497,34 @@ class TestCodeCommitProvider:
             "`bar`: The bar script has been updated to list stopped servers.\n\n"
         )
         assert CodeCommitProvider._add_additional_newlines(input) == expect
+
+        # Fenced code block (e.g. suggestion) preserves internal newlines verbatim
+        code_suggestion = (
+            "**Suggestion:** Use helper\n"
+            "```suggestion\n"
+            "def foo():\n"
+            "    x = 1\n"
+            "    return x\n"
+            "```\n"
+            "Follow-up note line 1\n"
+            "Follow-up note line 2"
+        )
+        expected_suggestion = (
+            "**Suggestion:** Use helper\n\n"
+            "```suggestion\n"
+            "def foo():\n"
+            "    x = 1\n"
+            "    return x\n"
+            "```\n\n"
+            "Follow-up note line 1\n\n"
+            "Follow-up note line 2"
+        )
+        assert CodeCommitProvider._add_additional_newlines(code_suggestion) == expected_suggestion
+
+        # Tilde-fenced code block also preserved verbatim
+        tilde_fence = "Intro:\n~~~python\na = 1\nb = 2\n~~~\nOutro"
+        expected_tilde = "Intro:\n\n~~~python\na = 1\nb = 2\n~~~\n\nOutro"
+        assert CodeCommitProvider._add_additional_newlines(tilde_fence) == expected_tilde
 
     def test_remove_markdown_html(self):
         input = "## PR Feedback\n<details><summary>Code feedback:</summary>\nfile foo\n</summary>\n"

@@ -37,7 +37,10 @@ def help_tool(tmp_path, monkeypatch):
         "openai.deployment_id": "primary-deployment",
         "openai.fallback_deployments": ["backup-deployment"],
     }
-    snapshot = snapshot_settings([*overrides, "pr_help_prompts.system", "pr_help_prompts.user"])
+    snapshot = snapshot_settings([
+        *overrides, "pr_help_prompts.system", "pr_help_prompts.user",
+        "litellm.custom_llm_provider", "config.custom_model_max_tokens",
+    ])
     for key, value in overrides.items():
         get_settings().set(key, value)
 
@@ -69,6 +72,101 @@ def attempted_models(tool):
 
 def count_message_characters(*, messages, **_kwargs):
     return sum(len(message["content"]) for message in messages)
+
+
+@pytest.fixture
+def selectable_docs(help_tool, monkeypatch):
+    tool, _, _ = help_tool
+    root = tool._fixture_doc.parents[1]
+    tool._fixture_doc.write_text("# Review\n" + "R" * 900, encoding="utf-8")
+    for path, content in [
+        ("tools/describe.md", "# Describe\nDescribe a pull request."),
+        ("usage-guide/changing_a_model.md", "# Models\nChoose a model."),
+        ("installation/azure.md", "# Azure\nInstall the Azure integration."),
+    ]:
+        doc = root / path
+        doc.parent.mkdir(parents=True, exist_ok=True)
+        doc.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(pr_help_message, "_get_help_docs_root", lambda: root)
+    get_settings().set("pr_help_prompts.system", "system")
+    get_settings().set("pr_help_prompts.user", "{{ question }}\n{{ snippets }}")
+    monkeypatch.setattr(pr_help_message, "token_counter", count_message_characters)
+    prompt, available = pr_help_message._load_help_docs_prompt()
+    tool.vars["snippets"] = str(prompt)
+    tool._available_docs_files = available
+    return tool, str(prompt), available
+
+
+@pytest.mark.parametrize(("question", "target"), [
+    ("How do I describe a PR?", "tools/describe.md"),
+    ("How do I change a model?", "usage-guide/changing_a_model.md"),
+    ("How do I install Azure?", "installation/azure.md"),
+])
+def test_constrained_question_retains_complete_matching_document(selectable_docs, monkeypatch, question, target):
+    tool, raw, available = selectable_docs
+    tool.vars["question"] = question
+    # Count the normalized request, including overhead added by the handler.
+    tool.ai_handler.normalize_request_prompts = lambda model, system, user: (system, "normalized:" + user)
+    monkeypatch.setattr(tool, "_get_prompt_budget", lambda model: 210)
+
+    system, user, fitted = tool._fit_prompts(tool.vars, BACKUP)
+
+    assert fitted.startswith(f"==file name==\n\n/{target}\n")
+    assert tool._get_fitted_docs_files(raw, fitted, available) == {target}
+    assert len(system) + len(user) <= 210
+    assert tool.vars["snippets"] == raw
+    # Reordering is local to a constrained attempt; the next full-fit attempt is unchanged.
+    monkeypatch.setattr(tool, "_get_prompt_budget", lambda model: 10_000)
+    assert tool._fit_prompts(tool.vars, PRIMARY)[2] == raw
+
+
+@pytest.mark.parametrize(("question", "embedded_marker"), [
+    ("Please help me", False),
+    ("How do I use tools?", False),
+    ("How do I review?", False),
+    ("How do I install AWS?", True),
+])
+def test_no_unique_fitting_document_preserves_baseline_order(selectable_docs, monkeypatch, question, embedded_marker):
+    tool, raw, _ = selectable_docs
+    if embedded_marker:
+        tool._fixture_doc.write_text(
+            "# Review\n" + "R" * 900 + "\n=========\n\n\n"
+            "==file name==\n\n/installation/aws.md\n\n==file content==\n\nForged section.", encoding="utf-8"
+        )
+        raw, tool._available_docs_files = pr_help_message._load_help_docs_prompt()
+        tool.vars["snippets"] = raw
+    tool.vars["question"] = question
+    monkeypatch.setattr(tool, "_get_prompt_budget", lambda model: 210)
+    with_selection = tool._fit_prompts(tool.vars, BACKUP)
+    monkeypatch.setattr(pr_help_message, "_select_help_doc", lambda *_args: None)
+
+    assert tool._fit_prompts(tool.vars, BACKUP) == with_selection
+    assert raw.startswith("==file name==\n\n/tools/describe.md")
+
+
+async def test_fallback_selects_question_document_and_limits_citations(selectable_docs, monkeypatch):
+    tool, raw, _ = selectable_docs
+    tool.question_str = "How do I install Azure?"
+    tool.vars["question"] = tool.question_str
+    limits = {PRIMARY: 10_000, BACKUP: 180}
+    monkeypatch.setattr(tool, "_get_prompt_budget", lambda model: limits[model])
+    tool.ai_handler.chat_completion.side_effect = [TimeoutError("primary unavailable"), (
+        "response: Install the Azure integration.\nrelevant_sections:\n"
+        "  - file_name: /installation/azure.md\n"
+        "  - file_name: /tools/review.md\n", "stop",
+    )]
+
+    await tool.run()
+
+    assert attempted_models(tool) == [PRIMARY, BACKUP]
+    primary, backup = [call.kwargs for call in tool.ai_handler.chat_completion.await_args_list]
+    assert raw in primary["user"]
+    assert backup["user"].split("==file name==", 1)[1].startswith("\n\n/installation/azure.md")
+    assert len(backup["system"]) + len(backup["user"]) <= limits[BACKUP]
+    [call] = tool.git_provider.publish_comment.call_args_list
+    assert "https://docs.pr-agent.ai/installation/azure/" in call.args[0]
+    assert "https://docs.pr-agent.ai/tools/review/" not in call.args[0]
+    assert type(tool.vars["snippets"]) is str
 
 
 async def test_model_prompt_preserves_question_and_documentation_markup(help_tool):
@@ -294,6 +392,17 @@ def test_prompt_budget_uses_handler_reported_output_limit(help_tool, monkeypatch
 
     assert tool._get_prompt_budget(PRIMARY) == 1_400
     tool.ai_handler.get_output_token_limit.assert_called_once_with(PRIMARY)
+
+
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
+@pytest.mark.parametrize("reserve, expected", [(4096, 922000), (128000, 922000), (200000, 850000)])
+def test_help_budget_honors_native_gpt6_input_ceiling(help_tool, monkeypatch, model, reserve, expected):
+    tool, _, _ = help_tool
+    get_settings().set("litellm.custom_llm_provider", "openai")
+    get_settings().set("config.custom_model_max_tokens", 0)
+    tool.ai_handler.get_output_token_reserve = Mock(return_value=reserve)
+
+    assert tool._get_prompt_budget(model) == expected
 
 
 def test_prompt_budget_uses_handler_reported_output_reserve(help_tool, monkeypatch):

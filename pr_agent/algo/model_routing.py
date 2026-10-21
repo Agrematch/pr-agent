@@ -6,15 +6,13 @@ provider's diff, so they do not depend on which model's tokenizer would count th
 """
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
-
 from pr_agent.algo.types import FilePatchInfo
 from pr_agent.algo.utils import ModelType
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
 
 
-def count_hunks(diff_files: List[FilePatchInfo]) -> int:
+def count_hunks(diff_files: list[FilePatchInfo]) -> int:
     """Count the diff hunks across the files. A patch without hunk headers still counts as one."""
     total = 0
     for diff_file in diff_files:
@@ -25,14 +23,14 @@ def count_hunks(diff_files: List[FilePatchInfo]) -> int:
     return total
 
 
-def _limit(rule, key: str) -> Optional[int]:
+def _limit(rule, key: str) -> int | None:
     value = rule.get(key)
     if value is None or value == "":
         return None
     return int(value)
 
 
-def route_primary_model(model_type: ModelType, git_provider) -> Optional[Tuple[str, Optional[str]]]:
+def route_primary_model(model_type: ModelType, git_provider) -> tuple[str, str | None] | None:
     """Return the (model, deployment_id) a routing rule picks for this pull request.
 
     None keeps the configured primary. Only a call for the regular model is routed: a tool that
@@ -50,8 +48,7 @@ def route_primary_model(model_type: ModelType, git_provider) -> Optional[Tuple[s
 
     diff_files = git_provider.get_diff_files()
     num_files = len(diff_files)
-    num_hunks = count_hunks(diff_files)
-    size = f"{num_hunks} hunks in {num_files} files"
+    num_hunks = None
     global_deployment_id = settings.get("openai.deployment_id", None)
 
     for rule in rules:
@@ -64,8 +61,6 @@ def route_primary_model(model_type: ModelType, git_provider) -> Optional[Tuple[s
         if not model or (max_hunks is None and max_files is None):
             get_logger().warning(f"Ignoring model routing rule without a model or a limit: {rule}")
             continue
-        if max_hunks is not None and num_hunks > max_hunks:
-            continue
         if max_files is not None and num_files > max_files:
             continue
         deployment_id = rule.get("deployment_id") or None
@@ -73,8 +68,15 @@ def route_primary_model(model_type: ModelType, git_provider) -> Optional[Tuple[s
             get_logger().warning(f"Model routing rule for '{model}' has no deployment_id while "
                                  f"openai.deployment_id is set, skipping it")
             continue
+        if max_hunks is not None:
+            if num_hunks is None:
+                num_hunks = count_hunks(diff_files)
+            if num_hunks > max_hunks:
+                continue
+        size = f"{num_hunks} hunks in {num_files} files" if num_hunks is not None else f"{num_files} files"
         get_logger().info(f"Model routing: {size}, using '{model}' as the primary model")
         return model, deployment_id
 
+    size = f"{num_hunks} hunks in {num_files} files" if num_hunks is not None else f"{num_files} files"
     get_logger().info(f"Model routing: {size} fit no rule, keeping the configured primary model")
     return None

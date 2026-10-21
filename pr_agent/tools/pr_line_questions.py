@@ -2,28 +2,40 @@ import copy
 from functools import partial
 from urllib.parse import unquote
 
-from jinja2 import Environment, StrictUndefined, select_autoescape
+from jinja2 import StrictUndefined, select_autoescape
+from jinja2.sandbox import SandboxedEnvironment
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.git_patch_processing import extract_hunk_lines_from_patch
+from pr_agent.algo.language_handler import build_language_file_matcher
 from pr_agent.algo.pr_processing import OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD, retry_with_fallback_models
+from pr_agent.algo.run_details import init_run_details
+from pr_agent.algo.run_output import append_run_details
 from pr_agent.algo.token_budget import AttemptTokenBudget
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import ModelType, decode_user_text_args
 from pr_agent.config_loader import get_settings, get_verbosity_level
 from pr_agent.git_providers import get_git_provider
-from pr_agent.git_providers.git_provider import get_main_pr_language
 from pr_agent.log import get_logger
+from pr_agent.tools.pr_questions import _sanitize_slash_commands
 
 
 class PR_LineQuestions:
     def __init__(self, pr_url: str, args=None, ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
         self.question_str = self.parse_args(args)
         self.git_provider = get_git_provider()(pr_url)
-        self.main_pr_language = get_main_pr_language(
-            self.git_provider.get_languages(), self.git_provider.get_files()
-        )
+        # Only the questioned file's language is needed for model-call logging.
+        # Loading the entire PR file inventory here can be expensive or incomplete.
+        file_name = get_settings().get("file_name", "") or ""
+        if get_settings().get("file_name_encoded", False):
+            file_name = unquote(file_name)
+        language_map = get_settings().get("language_extension_map_org", {}) or {}
+        try:
+            self.main_pr_language = (build_language_file_matcher(language_map)(file_name) or "").lower()
+        except (TypeError, ValueError, AttributeError) as exc:
+            get_logger().warning(f"Could not classify line question file for logging: {exc}")
+            self.main_pr_language = ""
         self.ai_handler = ai_handler()
         self.ai_handler.main_pr_language = self.main_pr_language
 
@@ -55,6 +67,8 @@ class PR_LineQuestions:
 
 
     async def run(self):
+        # A fresh collector so the run-details section reports only this command's model.
+        init_run_details()
         get_logger().info('Answering a PR lines question...')
         # if get_settings().config.publish_output:
         #     self.git_provider.publish_comment("Preparing answer...", is_temporary=True)
@@ -108,20 +122,23 @@ class PR_LineQuestions:
                 model_answer = answer_stripped[:-len("[THREAD_RESOLVED]")].rstrip()
 
             # sanitize the answer so that no line will start with "/"
-            model_answer_sanitized = model_answer.strip().replace("\n/", "\n /")
-            if model_answer_sanitized.startswith("/"):
-                model_answer_sanitized = " " + model_answer_sanitized
+            model_answer_sanitized = _sanitize_slash_commands(model_answer.strip())
 
             get_logger().info('Preparing answer...')
+            if not get_settings().config.publish_output:
+                get_logger().info(f"Answer:\n{model_answer_sanitized}")
+                return ""
+            # Appended after sanitizing: the section's own lines never start with "/".
+            answer_body = append_run_details(model_answer_sanitized, self.git_provider)
             if comment_id:
-                self.git_provider.reply_to_comment_from_comment_id(comment_id, model_answer_sanitized)
+                self.git_provider.reply_to_comment_from_comment_id(comment_id, answer_body)
                 if should_resolve:
                     if self.git_provider.resolve_comment_thread(comment_id):
                         get_logger().info(f"Resolved review thread for comment {comment_id}")
                     else:
                         get_logger().warning(f"Failed to resolve review thread for comment {comment_id}")
             else:
-                self.git_provider.publish_comment(model_answer_sanitized)
+                self.git_provider.publish_comment(answer_body)
         else:
             get_logger().info("No hunk matched the requested range for "
                               f"'{file_name}'; skipping the /ask_line model call")
@@ -129,6 +146,9 @@ class PR_LineQuestions:
             # broken bot, so say why nothing was answered.
             no_hunk_message = (f"Could not find the requested lines of `{file_name}` in this "
                                "pull request's diff, so there is nothing to answer about.")
+            if not get_settings().config.publish_output:
+                get_logger().info(no_hunk_message)
+                return ""
             if comment_id:
                 self.git_provider.reply_to_comment_from_comment_id(comment_id, no_hunk_message)
             else:
@@ -205,7 +225,7 @@ class PR_LineQuestions:
         return response
 
     def _render_prompts(self, variables):
-        environment = Environment(
+        environment = SandboxedEnvironment(
             autoescape=select_autoescape(default_for_string=False),
             undefined=StrictUndefined,
         )

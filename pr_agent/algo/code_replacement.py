@@ -5,8 +5,8 @@ has to be re-indented against the lines it replaces before it is offered as a co
 A Python replacement is also compiled in place, so a suggestion that would break the file is not offered.
 """
 
-from typing import Optional
 
+from pr_agent.algo.git_patch_processing import split_diff_lines
 from pr_agent.log import get_logger
 
 
@@ -157,7 +157,7 @@ def reindent_to_line(code_snippet: str, original_initial_line: str) -> str:
 
 
 def python_replacement_compiles(filename: str, head_file: str, relevant_lines_start: int,
-                                relevant_lines_end: int, new_code_snippet: str) -> Optional[bool]:
+                                relevant_lines_end: int, new_code_snippet: str) -> bool | None:
     """Return False only when a replacement makes valid Python fail compilation.
 
     Returns None when the check does not apply: not a Python file, the file does not compile as is,
@@ -174,7 +174,7 @@ def python_replacement_compiles(filename: str, head_file: str, relevant_lines_st
         get_logger().warning(f"Could not validate Python suggestion syntax: {e}")
         return None
 
-    file_lines = head_file.splitlines()
+    file_lines = split_diff_lines(head_file)
     if (relevant_lines_start < 1
             or relevant_lines_end < relevant_lines_start
             or relevant_lines_end > len(file_lines)):

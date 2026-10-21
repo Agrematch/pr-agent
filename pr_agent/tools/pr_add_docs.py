@@ -1,7 +1,5 @@
 import copy
-import textwrap
 from functools import partial
-from typing import Dict
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
@@ -15,10 +13,10 @@ from pr_agent.algo.prompt_fragments import render_diff_hunk_format
 from pr_agent.algo.run_details import record_command_failure
 from pr_agent.algo.token_budget import AttemptTokenBudget
 from pr_agent.algo.token_handler import TokenHandler
-from pr_agent.algo.utils import load_yaml
+from pr_agent.algo.utils import get_suggestion_fence, load_yaml
 from pr_agent.config_loader import get_settings, get_verbosity_level
 from pr_agent.git_providers import get_git_provider
-from pr_agent.git_providers.git_provider import get_main_pr_language
+from pr_agent.git_providers.git_provider import IncompleteProviderPullRequestFilesError, get_main_pr_language
 from pr_agent.log import get_logger
 
 
@@ -59,6 +57,7 @@ class PRAddDocs:
 
     async def run(self):
         temporary_comment_published = False
+        publication_failed = False
         try:
             get_logger().info('Generating code Docs for PR...')
             if get_settings().config.publish_output:
@@ -77,12 +76,21 @@ class PRAddDocs:
                 self.git_provider.remove_initial_comment()
                 temporary_comment_published = False
                 get_logger().info('Pushing inline code documentation...')
-                self.push_inline_docs(data)
+                publication_result = self.push_inline_docs(data)
+                if publication_result is False:
+                    publication_failed = True
+                    self.git_provider.publish_comment("Failed to publish code documentation for this PR.")
+                    raise RuntimeError("Failed to publish code documentation after individual retries")
         except Exception as e:
             get_logger().error(f"Failed to generate code documentation for PR, error: {e}")
             record_command_failure()
-            if get_settings().config.get("propagate_tool_errors", False):
+            if (
+                isinstance(e, IncompleteProviderPullRequestFilesError)
+                or get_settings().config.get("propagate_tool_errors", False)
+            ):
                 raise
+            if publication_failed:
+                return False
         finally:
             if temporary_comment_published:
                 try:
@@ -146,7 +154,7 @@ class PRAddDocs:
 
         return response
 
-    def _prepare_pr_code_docs(self) -> Dict:
+    def _prepare_pr_code_docs(self) -> dict:
         docs = self.prediction.strip()
         data = load_yaml(docs)
         if isinstance(data, list):
@@ -161,7 +169,8 @@ class PRAddDocs:
         docs = []
 
         if not data['Code Documentation']:
-            return self.git_provider.publish_comment('No code documentation found to improve this PR.')
+            self.git_provider.publish_comment('No code documentation found to improve this PR.')
+            return None
 
         for d in data['Code Documentation']:
             try:
@@ -174,8 +183,12 @@ class PRAddDocs:
                 if documentation:
                     new_code_snippet = self.dedent_code(relevant_file, relevant_line, documentation, doc_placement,
                                                         add_original_line=True)
+                    if new_code_snippet is None:
+                        continue
 
-                    body = "**Suggestion:** Proposed documentation\n```suggestion\n" + new_code_snippet + "\n```"
+                    fence = get_suggestion_fence(new_code_snippet)
+                    body = (f"**Suggestion:** Proposed documentation\n{fence}suggestion\n"
+                            + new_code_snippet + f"\n{fence}")
                     docs.append({'body': body, 'relevant_file': relevant_file,
                                  "relevant_lines_start": relevant_line,
                                  "relevant_lines_end": relevant_line})
@@ -183,15 +196,34 @@ class PRAddDocs:
                 if get_verbosity_level() >= 2:
                     get_logger().info(f"Could not parse code docs: {d}")
 
+        if not docs:
+            return None
         is_successful = self.git_provider.publish_code_suggestions(docs)
+        if is_successful is True:
+            return True
         if not is_successful:
             get_logger().info("Failed to publish code docs, trying to publish each docs separately")
+            retry_results = []
             for doc_suggestion in docs:
-                self.git_provider.publish_code_suggestions([doc_suggestion])
+                retry_results.append(self.git_provider.publish_code_suggestions([doc_suggestion]))
+            if is_successful is False and all(result is False for result in retry_results):
+                return False
+            if any(result is True for result in retry_results):
+                return True
+        return None
+
+    @staticmethod
+    def _indent_reference_line(file_lines, index, step):
+        """Return the closest non-blank line to index, searching in the direction of step."""
+        while 0 <= index < len(file_lines):
+            if file_lines[index].strip():
+                return file_lines[index]
+            index += step
+        return None
 
     def dedent_code(self, relevant_file, relevant_lines_start, new_code_snippet, doc_placement='after',
                     add_original_line=False):
-        try:  # dedent code snippet
+        try:  # Find the source line that supplies the indentation.
             self.diff_files = self.git_provider.diff_files if self.git_provider.diff_files \
                 else self.git_provider.get_diff_files()
             original_initial_line = None
@@ -208,27 +240,51 @@ class PRAddDocs:
                         return new_code_snippet
                     original_initial_line = file_lines[relevant_lines_start - 1]
                     break
-            if original_initial_line:
-                if doc_placement == 'after' and relevant_lines_start < len(file_lines):
-                    line = file_lines[relevant_lines_start]
+            if original_initial_line is not None:
+                if doc_placement == 'after' or not original_initial_line.strip():
+                    # A docstring placed after a "def" line belongs to the function body, so a
+                    # following line supplies the indentation. A blank target line has no
+                    # indentation of its own, and the next line reveals the block holding it.
+                    # Skip blank lines either way: anchoring on one indents the docstring to
+                    # column 0, which drops it out of the enclosing block.
+                    line = self._indent_reference_line(file_lines, relevant_lines_start, 1)
                 else:
                     line = original_initial_line
-                suggested_initial_line = new_code_snippet.splitlines()[0]
-                original_initial_spaces = len(line) - len(line.lstrip())
-                suggested_initial_spaces = len(suggested_initial_line) - len(suggested_initial_line.lstrip())
-                delta_spaces = original_initial_spaces - suggested_initial_spaces
-                if delta_spaces > 0:
-                    new_code_snippet = textwrap.indent(new_code_snippet, delta_spaces * " ").rstrip('\n')
-                if add_original_line:
-                    if doc_placement == 'after':
-                        new_code_snippet = original_initial_line + "\n" + new_code_snippet
-                    else:
-                        new_code_snippet = new_code_snippet.rstrip() + "\n" + original_initial_line
+                if line is None:
+                    line = self._indent_reference_line(file_lines, relevant_lines_start - 1, -1)
+                if line is None:
+                    return new_code_snippet
+            else:
+                return new_code_snippet
         except Exception as e:
             if get_verbosity_level() >= 2:
                 get_logger().info(f"Could not dedent code snippet for file {relevant_file}, error: {e}")
+            return new_code_snippet
 
-        return new_code_snippet
+        try:
+            snippet_lines = new_code_snippet.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+            first_line = next((item for item in snippet_lines if item.strip()), None)
+            if first_line is None:
+                return None
+            target_prefix = line[:len(line) - len(line.lstrip())]
+            snippet_prefix = first_line[:len(first_line) - len(first_line.lstrip())]
+            aligned_lines = []
+            for item in snippet_lines:
+                if not item.strip():
+                    aligned_lines.append("")
+                elif item.startswith(snippet_prefix):
+                    aligned_lines.append(target_prefix + item[len(snippet_prefix):])
+                else:
+                    return None
+            aligned = "\n".join(aligned_lines)
+            if add_original_line:
+                if doc_placement == 'after':
+                    return original_initial_line + "\n" + aligned
+                return aligned.rstrip() + "\n" + original_initial_line
+            return aligned
+        except Exception:
+            # Once an anchor exists, never publish documentation that could not be aligned.
+            return None
 
 
 def get_docs_for_language(language, style):

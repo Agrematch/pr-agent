@@ -4,12 +4,23 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from gitlab import Gitlab
-from gitlab.exceptions import GitlabAuthenticationError, GitlabError, GitlabGetError
+from gitlab.exceptions import (
+    GitlabAuthenticationError,
+    GitlabCreateError,
+    GitlabError,
+    GitlabGetError,
+    GitlabUpdateError,
+)
 from gitlab.v4.objects import ProjectFile, ProjectMergeRequest, ProjectMergeRequestManager
 from requests.exceptions import RequestException
 
 from pr_agent.algo.comment_identity import PRCodeSuggestionsIdentity, PRReviewHeader, PRReviewIdentity
-from pr_agent.git_providers.git_provider import DEFAULT_DISCUSSION_CONTEXT_CHARS, IncrementalPR
+from pr_agent.git_providers.git_provider import (
+    DEFAULT_DISCUSSION_CONTEXT_CHARS,
+    ConcurrentFileUpdateError,
+    FileContentSnapshot,
+    IncrementalPR,
+)
 from pr_agent.git_providers.gitlab_provider import (
     GitLabProvider,
     _GitLabIncrementalCommit,
@@ -102,6 +113,59 @@ class TestGitLabProvider:
             mock_gitlab_client.http_get.side_effect = _current_mr_metadata
             return provider
 
+    def test_get_commit_messages_reads_all_commits_with_larger_pages(self, gitlab_provider):
+        client = Gitlab("https://gitlab.example.com", private_token="test-token")
+        gitlab_provider.mr = client.projects.get("test/repo", lazy=True).mergerequests.get(1, lazy=True)
+        next_url = (
+            "https://gitlab.example.com/api/v4/projects/test%2Frepo/"
+            "merge_requests/1/commits?page=2&per_page=100"
+        )
+        responses = []
+        for start, stop, next_link in [(0, 100, next_url), (100, 101, None)]:
+            response = MagicMock()
+            response.json.return_value = [{"message": f"message {index}"} for index in range(start, stop)]
+            response.links = {"next": {"url": next_link}} if next_link else {}
+            response.headers = {}
+            responses.append(response)
+        client.http_request = MagicMock(side_effect=responses)
+
+        with patch("pr_agent.git_providers.gitlab_provider.get_settings") as mock_settings:
+            mock_settings.return_value.get.return_value = None
+            result = gitlab_provider.get_commit_messages()
+
+        assert result.splitlines() == [f"{index + 1}. message {index}" for index in range(101)]
+        assert client.http_request.call_count == 2
+        assert client.http_request.call_args_list[0].kwargs["per_page"] == 100
+        assert client.http_request.call_args_list[1].args[1] == next_url
+
+    def test_filtered_lockfile_name_is_available_without_ignored_paths(self, gitlab_provider):
+        def change(name):
+            return {
+                "old_path": name,
+                "new_path": name,
+                "diff": "@@ -1 +1 @@\n-old\n+new",
+                "new_file": False,
+                "deleted_file": False,
+                "renamed_file": False,
+            }
+
+        gitlab_provider._get_merge_request_changes = MagicMock(return_value={
+            "changes": [change("package.json"), change("pnpm-lock.yaml"), change("ignored.lock")],
+            "diff_refs": {"base_sha": "base", "head_sha": "head"},
+        })
+        mod = "pr_agent.git_providers.gitlab_provider"
+        with patch.object(
+            gitlab_provider, "_expand_submodule_changes", side_effect=lambda changes, refs: changes
+        ), patch(
+            f"{mod}.filter_ignored", side_effect=lambda changes, provider: changes[:2]
+        ), patch(f"{mod}.is_valid_file", side_effect=lambda name: name != "pnpm-lock.yaml"), patch.object(
+            gitlab_provider, "get_pr_file_content", return_value="content"
+        ):
+            diffs = gitlab_provider.get_diff_files()
+
+        assert [file.filename for file in diffs] == ["package.json"]
+        assert gitlab_provider.get_filtered_diff_file_names() == ["pnpm-lock.yaml"]
+
     def test_get_pr_file_content_success(self, gitlab_provider, mock_project):
         mock_file = MagicMock(ProjectFile)
         mock_file.decode.return_value = "# Changelog\n\n## v1.0.0\n- Initial release"
@@ -124,7 +188,7 @@ class TestGitLabProvider:
         mock_project.files.get.assert_called_once_with("CHANGELOG.md", "main")
 
     def test_get_pr_file_content_file_not_found(self, gitlab_provider, mock_project):
-        mock_project.files.get.side_effect = GitlabGetError("404 Not Found")
+        mock_project.files.get.side_effect = GitlabGetError("404 Not Found", response_code=404)
 
         content = gitlab_provider.get_pr_file_content("CHANGELOG.md", "main")
 
@@ -144,6 +208,71 @@ class TestGitLabProvider:
         content = gitlab_provider.get_pr_file_content("CHANGELOG.md", "main", propagate_errors=True)
 
         assert content == ""
+
+    def test_get_pr_file_content_required_file_raises_on_404(self, gitlab_provider, mock_project):
+        mock_project.files.get.side_effect = GitlabGetError("404 Not Found", response_code=404)
+
+        with pytest.raises(GitlabGetError):
+            gitlab_provider.get_pr_file_content(
+                "CHANGELOG.md", "main", propagate_errors=True, missing_is_error=True
+            )
+
+    @pytest.mark.parametrize("failed_ref,status", [("base", 404), ("head", 500)])
+    def test_missing_patch_does_not_invent_changes_after_content_error(
+        self, gitlab_provider, mock_project, failed_ref, status
+    ):
+        gitlab_provider._get_merge_request_changes = MagicMock(return_value={
+            "changes": [{
+                "old_path": "src/app.py", "new_path": "src/app.py", "diff": "",
+                "new_file": False, "deleted_file": False, "renamed_file": False,
+            }],
+            "diff_refs": {"base_sha": "base", "head_sha": "head"},
+        })
+
+        def get_file(_path, ref):
+            if ref == failed_ref:
+                raise GitlabGetError("File unavailable", response_code=status)
+            file_obj = MagicMock()
+            file_obj.decode.return_value = b"real content\n"
+            return file_obj
+
+        mock_project.files.get.side_effect = get_file
+        with patch.object(gitlab_provider, "_expand_submodule_changes", side_effect=lambda changes, refs: changes):
+            files = gitlab_provider.get_diff_files()
+
+        assert len(files) == 1
+        assert files[0].filename == "src/app.py"
+        assert files[0].patch == ""
+        assert files[0].content_fetch_failed is True
+
+    @pytest.mark.parametrize("new_file,expected_ref", [(True, "head"), (False, "base")])
+    def test_incremental_missing_patch_allows_absent_file_side(
+        self, gitlab_provider, mock_project, new_file, expected_ref
+    ):
+        change = {
+            "old_path": "src/app.py", "new_path": "src/app.py", "diff": "",
+            "new_file": new_file, "deleted_file": not new_file, "renamed_file": False,
+        }
+        gitlab_provider.incremental = IncrementalPR(True)
+        gitlab_provider.incremental.last_seen_commit = MagicMock(sha="base")
+        gitlab_provider._incremental_head_sha = "head"
+        gitlab_provider.unreviewed_files_map = {"src/app.py": change}
+        file_obj = MagicMock()
+        file_obj.decode.return_value = b"real content\n"
+
+        def get_file(_path, ref):
+            if ref != expected_ref:
+                raise GitlabGetError("404 Not Found", response_code=404)
+            return file_obj
+
+        mock_project.files.get.side_effect = get_file
+
+        with patch.object(gitlab_provider, "_expand_submodule_changes", side_effect=lambda changes, refs: changes):
+            files = gitlab_provider.get_diff_files()
+
+        assert mock_project.files.get.call_count == 2
+        assert files[0].patch
+        assert files[0].content_fetch_failed is False
 
     @pytest.mark.parametrize(
         "error",
@@ -176,7 +305,9 @@ class TestGitLabProvider:
         content = gitlab_provider.get_repo_file_content("AGENTS.md")
 
         assert content == "repo context"
-        mock_gitlab_client.projects.get.assert_called_with("test/repo")
+        # a lazy handle: the MR target branch is the ref, so the project payload is not needed
+        # (the fixture already fetched the MR itself, so check the last call rather than the count)
+        mock_gitlab_client.projects.get.assert_called_with("test/repo", lazy=True)
         mock_project.files.get.assert_called_once_with(file_path="AGENTS.md", ref="release-1.0")
         mock_file.decode.assert_called_once()
 
@@ -223,8 +354,180 @@ class TestGitLabProvider:
         with pytest.raises(GitlabGetError, match="500 Server Error"):
             gitlab_provider.get_repo_file_content("AGENTS.md")
 
+    @pytest.mark.parametrize("content", [b"", b"old contents"])
+    def test_file_snapshot_binds_content_to_last_commit(self, gitlab_provider, mock_project, content):
+        file_obj = MagicMock()
+        file_obj.decode.return_value = content
+        file_obj.last_commit_id = "captured-commit"
+        mock_project.files.get.return_value = file_obj
+
+        snapshot = gitlab_provider.get_pr_file_content_snapshot("CHANGELOG.md", "feature")
+
+        assert snapshot == FileContentSnapshot(content.decode(), True, "captured-commit")
+        mock_project.files.get.assert_called_once_with("CHANGELOG.md", "feature")
+
+    def test_file_snapshot_missing_is_distinct_from_empty(self, gitlab_provider, mock_project):
+        mock_project.files.get.side_effect = GitlabGetError("missing", response_code=404)
+        assert gitlab_provider.get_pr_file_content_snapshot("CHANGELOG.md", "feature") == FileContentSnapshot(
+            "", False, None
+        )
+
+    @pytest.mark.parametrize("status", [401, 500])
+    def test_file_snapshot_propagates_nonmissing_errors(self, gitlab_provider, mock_project, status):
+        error = GitlabGetError("read failed", response_code=status)
+        mock_project.files.get.side_effect = error
+        with pytest.raises(GitlabGetError) as raised:
+            gitlab_provider.get_pr_file_content_snapshot("CHANGELOG.md", "feature")
+        assert raised.value is error
+
+    def test_file_snapshot_propagates_decode_failure(self, gitlab_provider, mock_project):
+        error = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
+        mock_project.files.get.return_value.decode.side_effect = error
+        with pytest.raises(UnicodeDecodeError) as raised:
+            gitlab_provider.get_pr_file_content_snapshot("CHANGELOG.md", "feature")
+        assert raised.value is error
+
+    @pytest.mark.parametrize("contents", [None, 42])
+    def test_file_snapshot_rejects_malformed_content(self, gitlab_provider, mock_project, contents):
+        mock_project.files.get.return_value.decode.return_value = contents
+        mock_project.files.get.return_value.last_commit_id = "captured-commit"
+        with pytest.raises(TypeError, match="must contain text"):
+            gitlab_provider.get_pr_file_content_snapshot("CHANGELOG.md", "feature")
+
+    @pytest.mark.parametrize("expected_exists", [False, True])
+    def test_guarded_write_rejects_existence_transition(self, gitlab_provider, mock_project, expected_exists):
+        file_obj = MagicMock()
+        mock_project.files.get.return_value = file_obj
+        if expected_exists:
+            mock_project.files.get.side_effect = GitlabGetError("missing", response_code=404)
+        snapshot = FileContentSnapshot("old" if expected_exists else "", expected_exists,
+                                       "captured-commit" if expected_exists else None)
+        with pytest.raises(ConcurrentFileUpdateError):
+            gitlab_provider.create_or_update_pr_file(
+                "CHANGELOG.md", "feature", "new contents", expected_snapshot=snapshot
+            )
+        mock_project.files.create.assert_not_called()
+        file_obj.save.assert_not_called()
+
+    def test_guarded_write_never_creates_after_server_read_error(self, gitlab_provider, mock_project):
+        error = GitlabGetError("read failed", response_code=500)
+        mock_project.files.get.side_effect = error
+        with pytest.raises(GitlabGetError) as raised:
+            gitlab_provider.create_or_update_pr_file(
+                "CHANGELOG.md", "feature", "new contents", expected_snapshot=FileContentSnapshot("", False, None)
+            )
+        assert raised.value is error
+        mock_project.files.create.assert_not_called()
+
+    def test_guarded_write_serializes_captured_commit_through_real_sdk(self, gitlab_provider, mock_project):
+        from gitlab.v4.objects.files import ProjectFileManager
+
+        manager = MagicMock()
+        manager.parent_attrs = {}
+        manager._update_attrs = ProjectFileManager._update_attrs
+        manager.update.return_value = {"file_path": "CHANGELOG.md"}
+        file_obj = ProjectFile(manager, {"file_path": "CHANGELOG.md", "branch": "feature",
+                                       "content": "newer contents", "commit_message": "message",
+                                       "last_commit_id": "newer-commit"})
+        mock_project.files.get.return_value = file_obj
+
+        gitlab_provider.create_or_update_pr_file(
+            "CHANGELOG.md", "feature", "replacement", "message",
+            expected_snapshot=FileContentSnapshot("old", True, "captured-commit"),
+        )
+
+        manager.update.assert_called_once()
+        sent = manager.update.call_args.args[1]
+        assert sent["content"] == "replacement"
+        assert sent["last_commit_id"] == "captured-commit"
+
+    def test_guarded_write_converts_stale_file_rejection_to_concurrent_update(self, gitlab_provider, mock_project):
+        file_obj = MagicMock()
+        error = GitlabUpdateError(
+            "You are attempting to update a file that has changed since you started editing it.", response_code=400
+        )
+        file_obj.save.side_effect = error
+        mock_project.files.get.return_value = file_obj
+
+        with patch("pr_agent.git_providers.gitlab_provider.get_logger") as logger:
+            with pytest.raises(ConcurrentFileUpdateError) as raised:
+                gitlab_provider.create_or_update_pr_file(
+                    "CHANGELOG.md",
+                    "feature",
+                    "new contents",
+                    expected_snapshot=FileContentSnapshot("old", True, "captured-commit"),
+                )
+
+        assert raised.value.__cause__ is error
+        logger.return_value.warning.assert_called_once()
+        logger.return_value.error.assert_not_called()
+
+    def test_guarded_write_preserves_nonconcurrent_update_rejection(self, gitlab_provider, mock_project):
+        file_obj = MagicMock()
+        error = GitlabUpdateError("Commit failed", response_code=400)
+        file_obj.save.side_effect = error
+        mock_project.files.get.return_value = file_obj
+
+        with patch("pr_agent.git_providers.gitlab_provider.get_logger") as logger:
+            with pytest.raises(GitlabUpdateError) as raised:
+                gitlab_provider.create_or_update_pr_file(
+                    "CHANGELOG.md",
+                    "feature",
+                    "new contents",
+                    expected_snapshot=FileContentSnapshot("old", True, "captured-commit"),
+                )
+
+        assert raised.value is error
+        logger.return_value.warning.assert_not_called()
+        logger.return_value.error.assert_called_once()
+
+    def test_guarded_write_converts_concurrent_creation_to_concurrent_update(self, gitlab_provider, mock_project):
+        mock_project.files.get.side_effect = GitlabGetError("404 Not Found", response_code=404)
+        error = GitlabCreateError("A file with this name already exists", response_code=400)
+        mock_project.files.create.side_effect = error
+
+        with patch("pr_agent.git_providers.gitlab_provider.get_logger") as logger:
+            with pytest.raises(ConcurrentFileUpdateError, match="file appeared") as raised:
+                gitlab_provider.create_or_update_pr_file(
+                    "CHANGELOG.md", "feature", "new contents", expected_snapshot=FileContentSnapshot("", False, None)
+                )
+
+        assert raised.value.__cause__ is error
+        mock_project.files.get.assert_called_once_with("CHANGELOG.md", "feature")
+        mock_project.files.create.assert_called_once()
+        mock_project.files.update.assert_not_called()
+        logger.return_value.warning.assert_called_once()
+        logger.return_value.error.assert_not_called()
+        logger.return_value.debug.assert_not_called()
+
+    @pytest.mark.parametrize("message, status", [
+        ("Commit failed", 400),
+        ("A file with this name already exists", 409),
+        ("A file with this name already exists", 403),
+        ("Validation failed: A file with this name already exists", 400),
+    ])
+    def test_guarded_write_preserves_nonconcurrent_create_rejection(
+        self, gitlab_provider, mock_project, message, status
+    ):
+        mock_project.files.get.side_effect = GitlabGetError("404 Not Found", response_code=404)
+        error = GitlabCreateError(message, response_code=status)
+        mock_project.files.create.side_effect = error
+
+        with patch("pr_agent.git_providers.gitlab_provider.get_logger") as logger:
+            with pytest.raises(GitlabCreateError) as raised:
+                gitlab_provider.create_or_update_pr_file(
+                    "CHANGELOG.md", "feature", "new contents", expected_snapshot=FileContentSnapshot("", False, None)
+                )
+
+        assert raised.value is error
+        mock_project.files.get.assert_called_once_with("CHANGELOG.md", "feature")
+        mock_project.files.create.assert_called_once()
+        mock_project.files.update.assert_not_called()
+        logger.return_value.warning.assert_not_called()
+        logger.return_value.error.assert_called_once()
+
     def test_create_or_update_pr_file_create_new(self, gitlab_provider, mock_project):
-        mock_project.files.get.side_effect = GitlabGetError("404 Not Found")
+        mock_project.files.get.side_effect = GitlabGetError("404 Not Found", response_code=404)
         mock_file = MagicMock()
         mock_project.files.create.return_value = mock_file
 
@@ -232,7 +535,8 @@ class TestGitLabProvider:
         commit_message = "Add CHANGELOG.md"
 
         gitlab_provider.create_or_update_pr_file(
-            "CHANGELOG.md", "feature-branch", new_content, commit_message
+            "CHANGELOG.md", "feature-branch", new_content, commit_message,
+            expected_snapshot=FileContentSnapshot("", False, None),
         )
 
         mock_project.files.get.assert_called_once_with("CHANGELOG.md", "feature-branch")
@@ -246,27 +550,35 @@ class TestGitLabProvider:
     def test_create_or_update_pr_file_update_existing(self, gitlab_provider, mock_project):
         mock_file = MagicMock(ProjectFile)
         mock_file.content = "# Old changelog content"
+        mock_file.last_commit_id = "newer-commit"
         mock_project.files.get.return_value = mock_file
 
         new_content = "# New changelog content"
         commit_message = "Update CHANGELOG.md"
 
         gitlab_provider.create_or_update_pr_file(
-            "CHANGELOG.md", "feature-branch", new_content, commit_message
+            "CHANGELOG.md", "feature-branch", new_content, commit_message,
+            expected_snapshot=FileContentSnapshot("old", True, "captured-commit"),
         )
 
         mock_project.files.get.assert_called_once_with("CHANGELOG.md", "feature-branch")
         assert mock_file.content == new_content
+        assert mock_file.last_commit_id == "captured-commit"
         mock_file.save.assert_called_once_with(branch="feature-branch", commit_message=commit_message)
         mock_project.files.create.assert_not_called()
 
     def test_create_or_update_pr_file_update_exception(self, gitlab_provider, mock_project):
-        mock_project.files.get.side_effect = Exception("Network error")
+        # Non-404 read failure on an existing file must propagate instead of creating anything.
+        error = GitlabGetError("500 Server Error", response_code=500)
+        mock_project.files.get.side_effect = error
 
-        with pytest.raises(Exception):
+        with pytest.raises(GitlabGetError) as raised:
             gitlab_provider.create_or_update_pr_file(
-                "CHANGELOG.md", "feature-branch", "content", "message"
+                "CHANGELOG.md", "feature-branch", "content", "message",
+                expected_snapshot=FileContentSnapshot("old", True, "captured-commit"),
             )
+        assert raised.value is error
+        mock_project.files.create.assert_not_called()
 
     def test_has_create_or_update_pr_file_method(self, gitlab_provider):
         assert hasattr(gitlab_provider, "create_or_update_pr_file")
@@ -278,8 +590,10 @@ class TestGitLabProvider:
         sig = inspect.signature(gitlab_provider.create_or_update_pr_file)
         params = list(sig.parameters.keys())
 
-        expected_params = ['file_path', 'branch', 'contents', 'message']
+        expected_params = ['file_path', 'branch', 'contents', 'message', 'expected_snapshot']
         assert params == expected_params
+        assert sig.parameters["expected_snapshot"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert sig.parameters["expected_snapshot"].default is inspect.Parameter.empty
 
     @pytest.mark.parametrize("content,expected", [
         ("simple text", "simple text"),
@@ -553,7 +867,8 @@ class TestGitLabProvider:
     def test_compare_submodule_cached(self, gitlab_provider):
         proj = MagicMock()
         proj.repository_compare.return_value = {"diffs": [{"diff": "d"}]}
-        with patch.object(gitlab_provider, "_project_by_path", return_value=proj) as m_pbp:
+        with patch.object(gitlab_provider, "_project_by_path", return_value=proj) as m_pbp, \
+             patch.object(gitlab_provider, "_submodule_target_allowed", return_value=True):
             first = gitlab_provider._compare_submodule("grp/repo", "old", "new")
             second = gitlab_provider._compare_submodule("grp/repo", "old", "new")
 
@@ -576,6 +891,7 @@ class TestGitLabProvider:
         proj.repository_compare.return_value = comparison
 
         with patch.object(gitlab_provider, "_project_by_path", return_value=proj), \
+             patch.object(gitlab_provider, "_submodule_target_allowed", return_value=True), \
              patch("pr_agent.git_providers.gitlab_provider.get_logger") as mock_logger:
             first = gitlab_provider._compare_submodule("grp/repo", "old", "new")
             second = gitlab_provider._compare_submodule("grp/repo", "old", "new")
@@ -601,6 +917,7 @@ class TestGitLabProvider:
         proj.repository_compare.return_value = comparison
 
         with patch.object(gitlab_provider, "_project_by_path", return_value=proj), \
+             patch.object(gitlab_provider, "_submodule_target_allowed", return_value=True), \
              patch("pr_agent.git_providers.gitlab_provider.get_logger") as mock_logger:
             result = gitlab_provider._compare_submodule("grp/repo", "old", "new")
 
@@ -623,6 +940,7 @@ class TestGitLabProvider:
         with patch("pr_agent.git_providers.gitlab_provider.get_settings", return_value=settings), \
              patch.object(gitlab_provider, "_get_gitmodules_map", return_value={"src/lib_a": "group/child.git"}), \
              patch.object(gitlab_provider, "_project_by_path", return_value=child_project), \
+             patch.object(gitlab_provider, "_submodule_target_allowed", return_value=True), \
              patch.object(gitlab_provider, "get_pr_file_content", return_value=""):
             files = gitlab_provider.get_diff_files()
 
@@ -638,6 +956,28 @@ class TestGitLabProvider:
 
         assert result == cached_diffs
         m_pbp.assert_not_called()
+
+    @pytest.mark.parametrize("allowlist, resolved, can_read, expanded", [
+        ([], "group/lib", True, False),
+        (["secret-org/lib"], "secret-org/lib", True, False),
+        (["group/lib"], "group/lib", False, False),
+        (["group/lib"], "group/renamed", True, False),
+        (["group/lib"], "group/lib", True, True),
+    ])
+    def test_compare_submodule_applies_sibling_checks(self, gitlab_provider, allowlist, resolved, can_read, expanded):
+        proj = MagicMock(path_with_namespace=resolved)
+        proj.repository_compare.return_value = {"diffs": [{"diff": "d"}]}
+        settings = MagicMock()
+        settings.config.get.side_effect = lambda key, default=None: (
+            allowlist if key == "repo_context_sibling_repos" else default)
+        with patch("pr_agent.git_providers.git_provider.get_settings", return_value=settings), \
+             patch.object(gitlab_provider, "_project_by_path", return_value=proj), \
+             patch.object(gitlab_provider, "get_owning_namespace", return_value="group"), \
+             patch.object(gitlab_provider, "_requester_can_read_sibling_project", return_value=can_read):
+            result = gitlab_provider._compare_submodule("group/lib", "old", "new")
+
+        assert proj.repository_compare.called is expanded
+        assert result == ([{"diff": "d"}] if expanded else [])
 
     def test_parse_merge_request_url_handles_nested_project_paths(self, gitlab_provider):
         project_path, mr_id = gitlab_provider._parse_merge_request_url(
@@ -1130,7 +1470,7 @@ class TestGitLabProvider:
         assert discussions == [
             {
                 "thread_id": "bot-resolved",
-                "status": "resolved",
+                "status": "auto_resolved",
                 "file": "src/app.py",
                 "start_line": 12,
                 "end_line": 12,
@@ -1155,6 +1495,69 @@ class TestGitLabProvider:
                 "suggestion": _AGENT_BODY,
                 "replies": [],
             },
+        ]
+
+    def test_get_code_suggestion_thread_context_reports_applied_suggestions(self, gitlab_provider):
+        gitlab_provider._own_user_id = _BOT_USER_ID
+        applied = _thread_note(resolved=True, resolved_by={'id': _BOT_USER_ID, 'name': 'GitLab Bot'})
+        applied['suggestions'] = [{'id': 1, 'applied': True}]
+        not_applied = _thread_note()
+        not_applied['suggestions'] = [{'id': 2, 'applied': False}]
+
+        gitlab_provider.mr = MagicMock()
+        gitlab_provider.mr.discussions.list.return_value = [
+            _thread([applied], discussion_id='applied'),
+            _thread([not_applied], discussion_id='pending'),
+        ]
+
+        discussions = json.loads(gitlab_provider.get_code_suggestion_thread_context())
+
+        assert [(d["thread_id"], d["status"]) for d in discussions] == [("pending", "open"), ("applied", "applied")]
+
+    def test_get_code_suggestion_thread_context_treats_bot_resolution_as_resolved_when_identity_is_unknown(
+            self, gitlab_provider):
+        gitlab_provider._own_user_id = None
+        note = _thread_note(resolved=True, resolved_by={'id': _BOT_USER_ID, 'name': 'GitLab Bot'})
+
+        gitlab_provider.mr = MagicMock()
+        gitlab_provider.mr.discussions.list.return_value = [_thread([note], discussion_id='d1')]
+
+        discussions = json.loads(gitlab_provider.get_code_suggestion_thread_context())
+
+        assert discussions[0]["status"] == "resolved"
+
+    def test_get_code_suggestion_thread_context_uses_the_multi_line_range(self, gitlab_provider):
+        gitlab_provider._own_user_id = _BOT_USER_ID
+        note = _thread_note()
+        note['position']['line_range'] = {
+            'start': {'new_line': 10, 'old_line': None},
+            'end': {'new_line': 14, 'old_line': None},
+        }
+        deletion = _thread_note(line_key='old_line')
+        deletion['position']['line_range'] = {
+            'start': {'new_line': None, 'old_line': 3},
+            'end': {'new_line': None, 'old_line': 5},
+        }
+        renamed = _thread_note(line_key=None)
+        renamed['position'].update({'old_path': 'src/old_name.py', 'new_path': 'src/new_name.py'})
+        renamed['position']['line_range'] = {
+            'start': {'new_line': 7, 'old_line': None},
+            'end': {'new_line': 8, 'old_line': None},
+        }
+
+        gitlab_provider.mr = MagicMock()
+        gitlab_provider.mr.discussions.list.return_value = [
+            _thread([note], discussion_id='range'),
+            _thread([deletion], discussion_id='deleted'),
+            _thread([renamed], discussion_id='renamed'),
+        ]
+
+        discussions = json.loads(gitlab_provider.get_code_suggestion_thread_context())
+
+        assert [(d["thread_id"], d["file"], d["start_line"], d["end_line"]) for d in discussions] == [
+            ("renamed", "src/new_name.py", 7, 8),
+            ("deleted", "src/app.py", 3, 5),
+            ("range", "src/app.py", 10, 14),
         ]
 
     def test_get_code_suggestion_thread_context_truncates_messages_and_replies(self, gitlab_provider):
@@ -1541,6 +1944,7 @@ class TestGitLabGlobalSettings:
     def _provider(self, gitlab_url="https://gitlab.com"):
         provider = GitLabProvider.__new__(GitLabProvider)
         provider.gl = MagicMock()
+        provider.gl.oauth_token = "fake_token"
         provider.id_project = "mygroup/myrepo"
         provider.gitlab_url = gitlab_url
         return provider
@@ -1551,8 +1955,10 @@ class TestGitLabGlobalSettings:
         proj.default_branch = "main"
         proj.files.get.return_value.decode.return_value = b"[pr_reviewer]\nnum_max_findings = 5\n"
         provider.gl.projects.get.return_value = proj
-        with patch("pr_agent.git_providers.git_provider.get_settings") as ms:
+        with patch("pr_agent.git_providers.git_provider.get_settings") as ms, \
+             patch("pr_agent.git_providers.gitlab_provider.get_settings", return_value=ms.return_value):
             ms.return_value.config.use_global_settings_file = True
+            ms.return_value.config.global_settings_repo = "pr-agent-settings"
             result = provider._get_global_repo_settings()
         assert result == b"[pr_reviewer]\nnum_max_findings = 5\n"
         provider.gl.projects.get.assert_called_with("mygroup/pr-agent-settings")
@@ -1567,8 +1973,10 @@ class TestGitLabGlobalSettings:
         settings_project.files.get.return_value.decode.return_value = b"[pr_reviewer]\nnum_max_findings = 5\n"
         provider.gl.projects.get.side_effect = [project, settings_project]
 
-        with patch("pr_agent.git_providers.git_provider.get_settings") as ms:
+        with patch("pr_agent.git_providers.git_provider.get_settings") as ms, \
+             patch("pr_agent.git_providers.gitlab_provider.get_settings", return_value=ms.return_value):
             ms.return_value.config.use_global_settings_file = True
+            ms.return_value.config.global_settings_repo = "pr-agent-settings"
             result = provider._get_global_repo_settings()
 
         assert result == b"[pr_reviewer]\nnum_max_findings = 5\n"
@@ -1583,31 +1991,94 @@ class TestGitLabGlobalSettings:
         proj.default_branch = "main"
         proj.files.get.return_value.decode.return_value = b"[pr_reviewer]\nnum_max_findings = 5\n"
         provider.gl.projects.get.return_value = proj
-        with patch("pr_agent.git_providers.git_provider.get_settings") as ms:
+        with patch("pr_agent.git_providers.git_provider.get_settings") as ms, \
+             patch("pr_agent.git_providers.gitlab_provider.get_settings", return_value=ms.return_value):
             ms.return_value.config.use_global_settings_file = True
+            ms.return_value.config.global_settings_repo = "pr-agent-settings"
             result = provider._get_global_repo_settings()
         assert result == b"[pr_reviewer]\nnum_max_findings = 5\n"
         provider.gl.projects.get.assert_called_with("mygroup/pr-agent-settings")
 
     def test_disabled_returns_empty(self):
         provider = self._provider()
-        with patch("pr_agent.git_providers.git_provider.get_settings") as ms:
+        with patch("pr_agent.git_providers.git_provider.get_settings") as ms, \
+             patch("pr_agent.git_providers.gitlab_provider.get_settings", return_value=ms.return_value):
             ms.return_value.config.use_global_settings_file = False
             assert provider._get_global_repo_settings() == ""
         provider.gl.projects.get.assert_not_called()
 
-    def test_result_is_cached(self):
+    @pytest.mark.parametrize("contents", [b"[pr_reviewer]\nx = 1\n", b""])
+    def test_result_is_cached(self, contents):
         provider = self._provider()
         proj = MagicMock()
         proj.default_branch = "main"
-        proj.files.get.return_value.decode.return_value = b"[pr_reviewer]\nx = 1\n"
+        proj.files.get.return_value.decode.return_value = contents
         provider.gl.projects.get.return_value = proj
-        with patch("pr_agent.git_providers.git_provider.get_settings") as ms:
+        with patch("pr_agent.git_providers.git_provider.get_settings") as ms, \
+             patch("pr_agent.git_providers.gitlab_provider.get_settings", return_value=ms.return_value):
             ms.return_value.config.use_global_settings_file = True
-            provider._get_global_repo_settings()
-            provider._get_global_repo_settings()
-        # Only one lookup for the settings project despite two calls (cached).
-        assert provider.gl.projects.get.call_count == 1
+            ms.return_value.config.global_settings_repo = "pr-agent-settings"
+            assert provider._get_global_repo_settings() == contents
+            assert provider._get_global_repo_settings() == contents
+        provider.gl.projects.get.assert_called_once_with("mygroup/pr-agent-settings")
+        proj.files.get.assert_called_once_with(file_path=".pr_agent.toml", ref="main")
+
+    @pytest.mark.parametrize("failure_at", ["project", "file"])
+    @pytest.mark.parametrize("response_code", [403, 404])
+    def test_missing_or_inaccessible_settings_are_cached(self, failure_at, response_code):
+        provider = self._provider()
+        proj = MagicMock(default_branch="main")
+        provider.gl.projects.get.return_value = proj
+        fetch = provider.gl.projects.get if failure_at == "project" else proj.files.get
+        fetch.side_effect = GitlabGetError("Unavailable", response_code=response_code)
+
+        with patch("pr_agent.git_providers.git_provider.get_settings") as ms, \
+             patch("pr_agent.git_providers.gitlab_provider.get_settings", return_value=ms.return_value):
+            ms.return_value.config.use_global_settings_file = True
+            ms.return_value.config.global_settings_repo = "pr-agent-settings"
+            assert provider._get_global_repo_settings() == ""
+            assert provider._get_global_repo_settings() == ""
+
+        provider.gl.projects.get.assert_called_once_with("mygroup/pr-agent-settings")
+        if failure_at == "project":
+            proj.files.get.assert_not_called()
+        else:
+            proj.files.get.assert_called_once_with(file_path=".pr_agent.toml", ref="main")
+
+    @pytest.mark.parametrize("failure_at", ["project", "file"])
+    @pytest.mark.parametrize("error", [
+        pytest.param(GitlabGetError("Unauthorized", response_code=401), id="401"),
+        pytest.param(GitlabGetError("Rate limited", response_code=429), id="429"),
+        pytest.param(GitlabGetError("Server error", response_code=500), id="500"),
+        pytest.param(GitlabGetError("Bad gateway", response_code=502), id="502"),
+        pytest.param(GitlabGetError("Unavailable", response_code=503), id="503"),
+        pytest.param(GitlabGetError("Unknown status"), id="unknown-status"),
+        pytest.param(RequestException("Connection failed"), id="connection"),
+        pytest.param(RuntimeError("Unexpected error"), id="unexpected"),
+    ])
+    def test_failed_settings_fetch_is_retried_then_success_is_cached(self, failure_at, error):
+        provider = self._provider()
+        proj = MagicMock(default_branch="main")
+        contents = b"[pr_reviewer]\nx = 1\n"
+        settings_file = MagicMock()
+        settings_file.decode.return_value = contents
+        provider.gl.projects.get.return_value = proj
+        proj.files.get.return_value = settings_file
+        if failure_at == "project":
+            provider.gl.projects.get.side_effect = [error, proj]
+        else:
+            proj.files.get.side_effect = [error, settings_file]
+
+        with patch("pr_agent.git_providers.git_provider.get_settings") as ms, \
+             patch("pr_agent.git_providers.gitlab_provider.get_settings", return_value=ms.return_value):
+            ms.return_value.config.use_global_settings_file = True
+            ms.return_value.config.global_settings_repo = "pr-agent-settings"
+            assert provider._get_global_repo_settings() == ""
+            assert provider._get_global_repo_settings() == contents
+            assert provider._get_global_repo_settings() == contents
+
+        assert provider.gl.projects.get.call_count == 2
+        assert proj.files.get.call_count == (1 if failure_at == "project" else 2)
 
 class TestGitLabIncrementalHelpers:
     """Pure-function tests for the incremental-review helpers."""
@@ -1744,7 +2215,8 @@ class TestGitLabIncrementalReview:
         c.created_at = committed_date
         return c
 
-    def test_get_incremental_commits_no_previous_review_falls_back(self, gitlab_provider):
+    @pytest.mark.parametrize("kind", ["review", "suggestions"])
+    def test_get_incremental_commits_no_previous_review_falls_back(self, gitlab_provider, kind):
         gitlab_provider.mr.notes.list.return_value = [
             self._make_note(1, "Just a comment", "2024-05-01T10:00:00Z"),
         ]
@@ -1752,9 +2224,10 @@ class TestGitLabIncrementalReview:
             self._make_commit("c1", "2024-05-02T10:00:00Z"),
         ]
 
-        gitlab_provider.get_incremental_commits(IncrementalPR(True))
+        gitlab_provider.get_incremental_commits(IncrementalPR(True), kind=kind)
 
         assert gitlab_provider.incremental.is_incremental is False
+        gitlab_provider.mr.commits.assert_not_called()
 
     def test_get_incremental_commits_picks_commits_after_review(self, gitlab_provider, mock_project):
         # Previous review at T=10:00. Commit c0 at 09:00 (before), c1 and c2 at 11:00 (after).
@@ -1787,6 +2260,7 @@ class TestGitLabIncrementalReview:
         assert gitlab_provider.incremental.last_seen_commit_sha == "c0"
         assert set(gitlab_provider.unreviewed_files_map.keys()) == {"a.py", "b.py"}
         mock_project.repository_compare.assert_called_once_with("c0", "head")
+        gitlab_provider.mr.commits.assert_called_once_with()
 
     def test_get_incremental_commits_no_new_commits_yields_empty_set(self, gitlab_provider, mock_project):
         gitlab_provider.mr.notes.list.return_value = [
@@ -2131,7 +2605,7 @@ class TestGitLabIncrementalReview:
         assert mock_project.repository_compare.call_count == 2
 
     def test_incremental_suggestions_anchor_advances_with_in_place_edits(self, gitlab_provider, mock_project):
-        # Default /improve config (persistent_comment=true, commitable_code_suggestions=false)
+        # Default /improve config (persistent_comment=true, committable_code_suggestions=false)
         # EDITS the "## PR Code Suggestions ✨" summary note in place on every run, so its
         # created_at stays frozen at the first run. The incremental window must anchor on
         # updated_at (the latest run), otherwise it grows from the first run and keeps
@@ -2374,6 +2848,7 @@ class TestGitLabIncrementalReview:
         with patch("pr_agent.git_providers.gitlab_provider.get_settings", return_value=settings), \
              patch.object(gitlab_provider, "_get_gitmodules_map", return_value={"libs/sub": "group/child.git"}), \
              patch.object(gitlab_provider, "_project_by_path", return_value=child_project), \
+             patch.object(gitlab_provider, "_submodule_target_allowed", return_value=True), \
              patch.object(gitlab_provider, "get_pr_file_content", return_value=""):
             files = gitlab_provider.get_diff_files()
 

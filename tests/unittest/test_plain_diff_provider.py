@@ -1,4 +1,8 @@
+import io
+import sys
+
 import pytest
+from git import Repo
 
 from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.config_loader import get_settings
@@ -8,7 +12,7 @@ from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
 
 # Diff-mode settings keys these tests mutate on the process-wide singleton.
 _SETTINGS_KEYS = ["plain_diff.content", "plain_diff.output_path",
-                  "config.git_provider", "config.publish_output"]
+                  "config.git_provider", "config.publish_output", "ignore.glob", "ignore.regex"]
 
 
 @pytest.fixture(autouse=True)
@@ -65,6 +69,30 @@ def test_get_diff_files(cfg):
     assert files[0].edit_type == EDIT_TYPE.MODIFIED
 
 
+@pytest.mark.parametrize("quote_path", ["true", "false"])
+@pytest.mark.parametrize("filename", ["测试.py", 'quote"name.py', "tab\tname.py", "back\\slash.py"])
+def test_git_quoted_paths_preserve_working_tree_context(cfg, tmp_path, monkeypatch, filename, quote_path):
+    repo = Repo.init(tmp_path)
+    path = tmp_path / filename
+    path.write_text("before\n", encoding="utf-8")
+    repo.index.add([filename])
+    path.write_text("after\n", encoding="utf-8")
+    diff = repo.git.execute([
+        "git", "-c", f"core.quotePath={quote_path}", "diff", "--no-ext-diff", "--no-textconv", "--", filename,
+    ])
+    monkeypatch.chdir(tmp_path)
+    cfg("plain_diff.content", diff)
+    cfg("plain_diff.output_path", None)
+
+    provider = PlainDiffGitProvider(None)
+    file = provider.get_diff_files()[0]
+
+    assert provider.get_files() == [filename]
+    assert file.head_file == "after\n"
+    assert file.base_file == "before\n"
+    assert provider.get_languages() == {"Python": 100.0}
+
+
 _MULTI_LANG_DIFF = """diff --git a/foo.py b/foo.py
 --- a/foo.py
 +++ b/foo.py
@@ -84,6 +112,18 @@ diff --git a/weird.zzz b/weird.zzz
  p
 +q
 """
+
+
+def test_plain_diff_applies_ignore_rules_to_files_and_patches(cfg, monkeypatch):
+    cfg("plain_diff.content", _MULTI_LANG_DIFF)
+    cfg("ignore.glob", ["foo.py"])
+    cfg("ignore.regex", [])
+    monkeypatch.setattr("pr_agent.git_providers.plain_diff_provider._find_repository_root", lambda: None)
+
+    provider = PlainDiffGitProvider(None)
+    assert provider.get_files() == ["app.js", "weird.zzz"]
+    assert [file.filename for file in provider.get_diff_files()] == ["app.js", "weird.zzz"]
+
 
 _FILENAME_MATCHING_DIFF = """diff --git a/upper.C b/upper.C
 --- a/upper.C
@@ -156,6 +196,20 @@ def test_publish_comment_to_file(cfg, tmp_path):
     provider = PlainDiffGitProvider(None)
     provider.publish_comment("# Review\nsaved")
     assert "saved" in out.read_text(encoding="utf-8")
+
+
+def test_publish_comment_survives_stdout_that_cannot_encode(cfg, tmp_path, monkeypatch):
+    # Simulate a redirected Windows stdout (cp1252) and check that emoji in tool
+    # output neither abort publishing nor skip the --output file.
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="cp1252"))
+    out = tmp_path / "review.md"
+    cfg("plain_diff.content", DIFF)
+    cfg("plain_diff.output_path", str(out))
+    provider = PlainDiffGitProvider(None)
+    provider.publish_comment("## ✨ Review\nlooks good")
+    assert raw.getvalue().decode("utf-8") == "## ✨ Review\nlooks good\n"
+    assert out.read_text(encoding="utf-8") == "## ✨ Review\nlooks good"
 
 
 def test_empty_diff_raises(cfg):

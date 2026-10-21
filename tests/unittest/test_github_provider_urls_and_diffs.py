@@ -8,9 +8,13 @@ wiring fake PR/file/repo objects for get_diff_files.
 """
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 from github import GithubException, RateLimitExceededException
+from github.PullRequest import PullRequest
+from github.Repository import Repository
+from requests.exceptions import ConnectionError as RequestsConnectionError
 
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.git_providers import github_provider
@@ -65,6 +69,20 @@ class TestParsePrUrl:
         )
         assert repo == "owner/repo"
         assert num == 55
+
+    def test_api_v3_in_query_does_not_change_url_classification(self):
+        p = _bare_provider()
+        assert p._parse_pr_url("https://github.com/owner/repo/pull/123?note=/api/v3") == ("owner/repo", 123)
+
+    def test_api_v30_path_is_not_github_api_prefix(self):
+        p = _bare_provider()
+        with pytest.raises(ValueError):
+            p._parse_pr_url("https://github.com/api/v30/repos/owner/repo/pulls/1")
+
+    def test_api_hostname_lookalike_is_not_github_api(self):
+        p = _bare_provider()
+        with pytest.raises(ValueError):
+            p._parse_pr_url("https://fakeapi.github.com.evil.net/repos/owner/repo/pulls/1")
 
     def test_trailing_slash(self):
         p = _bare_provider()
@@ -123,6 +141,20 @@ class TestParseIssueUrl:
         )
         assert repo == "owner/repo"
         assert num == 8
+
+    def test_api_v3_in_query_does_not_change_url_classification(self):
+        p = _bare_provider()
+        assert p._parse_issue_url("https://github.com/owner/repo/issues/123?note=/api/v3") == ("owner/repo", 123)
+
+    def test_api_v30_path_is_not_github_api_prefix(self):
+        p = _bare_provider()
+        with pytest.raises(ValueError):
+            p._parse_issue_url("https://github.com/api/v30/repos/owner/repo/issues/1")
+
+    def test_api_hostname_lookalike_is_not_github_api(self):
+        p = _bare_provider()
+        with pytest.raises(ValueError):
+            p._parse_issue_url("https://fakeapi.github.com.evil.net/repos/owner/repo/issues/1")
 
     def test_invalid_url_non_integer(self):
         p = _bare_provider()
@@ -224,11 +256,12 @@ def _make_provider_for_diff(files):
     p.unreviewed_files_map = {}
     # pr.base/head shas drive repo.compare which we stub out below.
     p.pr = SimpleNamespace(
-        base=SimpleNamespace(sha="base-sha"),
+        base=SimpleNamespace(sha="base-sha", ref="main"),
         head=SimpleNamespace(sha="head-sha"),
         get_files=lambda: files,
         changed_files=len(files),
     )
+    p._get_pr = lambda: p.pr
     # repo_obj.compare returns an object with a merge_base_commit.
     p.repo_obj = SimpleNamespace(
         compare=lambda b, h: SimpleNamespace(
@@ -300,6 +333,23 @@ class TestGetDiffFilesEditTypes:
         # No fake _get_pr_file_content needed because it should not be called.
         assert p.get_diff_files() is sentinel
 
+    def test_filtered_lockfile_name_is_available_without_ignored_paths(self):
+        files = [
+            _make_file("package.json", "modified"),
+            _make_file("pnpm-lock.yaml", "modified"),
+            _make_file("ignored.lock", "modified"),
+        ]
+        p = _make_provider_for_diff(files)
+        p._get_pr_file_content = lambda file, sha, path=None: "content"
+        mod = "pr_agent.git_providers.github_provider"
+        with patch(f"{mod}.filter_ignored", side_effect=lambda entries: entries[:2]), patch(
+            f"{mod}.is_valid_file", side_effect=lambda name: name != "pnpm-lock.yaml"
+        ):
+            diffs = p.get_diff_files()
+
+        assert [file.filename for file in diffs] == ["package.json"]
+        assert p.get_filtered_diff_file_names() == ["pnpm-lock.yaml"]
+
     def test_additions_deletions_propagated(self, patched_helpers):
         f = _make_file("x.py", "modified", additions=5, deletions=2)
         p = _make_provider_for_diff([f])
@@ -365,6 +415,96 @@ class TestGetDiffFilesContentReads:
         p.get_diff_files()
 
         assert [call.args[1] for call in spy.call_args_list] == ["base-sha"]
+
+
+class TestLazyMergeBaseLookup:
+    @pytest.mark.parametrize("status", ["added", "removed", "modified"])
+    def test_compare_only_when_base_content_is_needed(self, patched_helpers, status):
+        file = _make_file(f"{status}.py", status)
+        provider = _make_provider_for_diff([file])
+        provider.repo_obj.compare = Mock(
+            return_value=SimpleNamespace(merge_base_commit=SimpleNamespace(sha="merge-base-sha"))
+        )
+        read = Mock(return_value="content")
+        provider._get_pr_file_content = read
+
+        provider.get_diff_files()
+
+        assert provider.repo_obj.compare.call_count == (0 if status == "added" else 1)
+        expected_refs = {
+            "added": ["head-sha"],
+            "removed": ["merge-base-sha"],
+            "modified": ["head-sha", "merge-base-sha"],
+        }
+        assert [call.args[1] for call in read.call_args_list] == expected_refs[status]
+
+    @pytest.mark.parametrize("files", [
+        [],
+        [_make_file("image.png", "modified")],
+    ])
+    def test_empty_or_unsupported_files_skip_compare(self, patched_helpers, files):
+        provider = _make_provider_for_diff(files)
+        provider.repo_obj.compare = Mock(side_effect=AssertionError("unnecessary compare"))
+        provider._get_pr_file_content = Mock(return_value="content")
+        if files:
+            with patch("pr_agent.git_providers.github_provider.is_valid_file", return_value=False):
+                provider.get_diff_files()
+        else:
+            provider.get_diff_files()
+        provider.repo_obj.compare.assert_not_called()
+
+    def test_filtered_files_skip_compare(self, patched_helpers):
+        provider = _make_provider_for_diff([_make_file("ignored.py", "modified")])
+        provider.repo_obj.compare = Mock(side_effect=AssertionError("unnecessary compare"))
+        with patch("pr_agent.git_providers.github_provider.filter_ignored", return_value=[]):
+            assert provider.get_diff_files() == []
+        provider.repo_obj.compare.assert_not_called()
+
+    def test_incremental_review_skips_merge_base(self, patched_helpers):
+        file = _make_file("changed.py", "modified")
+        provider = _make_provider_for_diff([file])
+        provider.incremental = SimpleNamespace(is_incremental=True, last_seen_commit_sha="prev-sha")
+        provider.unreviewed_files_map = {"changed.py": file}
+        provider.repo_obj.compare = Mock(side_effect=AssertionError("unnecessary compare"))
+        provider._get_pr_file_content = Mock(return_value="content")
+
+        provider.get_diff_files()
+
+        provider.repo_obj.compare.assert_not_called()
+        assert [call.args[1] for call in provider._get_pr_file_content.call_args_list] == [
+            "head-sha", "prev-sha",
+        ]
+
+    def test_merge_base_is_reused_across_content_reads(self, patched_helpers):
+        files = [_make_file("a.py", "modified"), _make_file("b.py", "renamed", previous_filename="old.py")]
+        provider = _make_provider_for_diff(files)
+        provider.repo_obj.compare = Mock(
+            return_value=SimpleNamespace(merge_base_commit=SimpleNamespace(sha="merge-base-sha"))
+        )
+        provider._get_pr_file_content = Mock(return_value="content")
+
+        provider.get_diff_files()
+
+        provider.repo_obj.compare.assert_called_once_with("base-sha", "head-sha")
+        assert [call.args[1] for call in provider._get_pr_file_content.call_args_list] == [
+            "head-sha", "merge-base-sha", "head-sha", "merge-base-sha",
+        ]
+        assert provider._get_pr_file_content.call_args_list[-1].kwargs["path"] == "old.py"
+
+    def test_failed_merge_base_keeps_existing_base_fallback(self, patched_helpers):
+        file = _make_file("changed.py", "modified")
+        provider = _make_provider_for_diff([file])
+        provider.repo_obj.compare = Mock(
+            side_effect=GithubException(500, {"message": "temporary failure"}, None)
+        )
+        provider._get_pr_file_content = Mock(return_value="content")
+
+        provider.get_diff_files()
+
+        provider.repo_obj.compare.assert_called_once()
+        assert [call.args[1] for call in provider._get_pr_file_content.call_args_list] == [
+            "head-sha", "base-sha",
+        ]
 
 
 class TestGetDiffFilesRename:
@@ -460,6 +600,8 @@ class _FakePullRequest:
         self.files = files
         self.changed_files = changed_files
         self.get_files_calls = 0
+        self.head = SimpleNamespace(sha="head-sha")
+        self.base = SimpleNamespace(sha="base-sha", ref="main")
 
     def get_files(self):
         self.get_files_calls += 1
@@ -503,6 +645,8 @@ class _SequencedChangedFilesPullRequest:
         self.outcomes = list(outcomes)
         self.get_files_calls = 0
         self.changed_files_calls = 0
+        self.head = SimpleNamespace(sha="head-sha")
+        self.base = SimpleNamespace(sha="base-sha", ref="main")
 
     def get_files(self):
         self.get_files_calls += 1
@@ -543,6 +687,7 @@ class _TransientIterable:
 def _make_provider_for_file_collection(pr, *, incremental=False, unreviewed_files_map=None):
     provider = _bare_provider()
     provider.pr = pr
+    provider._get_pr = Mock(return_value=pr)
     provider.git_files = None
     provider.diff_files = None
     provider.incremental = SimpleNamespace(is_incremental=incremental)
@@ -606,8 +751,9 @@ class TestCompletePullRequestFiles:
             provider.get_files()
 
         assert raised.value is error
-        assert pr.get_files_calls == 2
-        assert pr.changed_files_calls == 2
+        assert pr.get_files_calls == 0
+        assert pr.changed_files_calls == 1
+        provider._get_pr.assert_not_called()
         assert provider.git_files is None
         assert "git_files" not in request_context
 
@@ -635,14 +781,16 @@ class TestCompletePullRequestFiles:
             provider.get_files()
 
         assert raised.value is error
-        assert pr.get_files_calls == 1
+        assert pr.get_files_calls == 0
         assert pr.changed_files_calls == 1
+        provider._get_pr.assert_not_called()
         assert provider.git_files is None
         assert "git_files" not in request_context
 
-    def test_non_rate_limit_403_uses_the_ordinary_retry_policy(self, monkeypatch):
+    @pytest.mark.parametrize("status", [403, 404, 422])
+    def test_permanent_client_error_skips_file_collection_retry(self, monkeypatch, status):
         request_context = _set_request_context(monkeypatch)
-        error = GithubException(403, {"message": "Resource not accessible by integration"}, None)
+        error = GithubException(status, {"message": "Resource not accessible"}, None)
         pr = _FakePullRequest(error, 1)
         provider = _make_provider_for_file_collection(pr)
 
@@ -650,20 +798,39 @@ class TestCompletePullRequestFiles:
             provider.get_files()
 
         assert raised.value is error
-        assert pr.get_files_calls == 2
+        assert pr.get_files_calls == 1
         assert provider.git_files is None
         assert "git_files" not in request_context
 
     @pytest.mark.parametrize(
         "failure",
-        [RuntimeError("request failed"), _ExplodingIterable(RuntimeError("page failed"))],
+        [ValueError("malformed file list"), _ExplodingIterable(RuntimeError("page processing failed"))],
+    )
+    def test_programming_errors_do_not_retry_or_populate_cache(self, monkeypatch, failure):
+        request_context = _set_request_context(monkeypatch)
+        pr = _FakePullRequest(failure, 1)
+        provider = _make_provider_for_file_collection(pr)
+
+        with pytest.raises((ValueError, RuntimeError)):
+            provider.get_files()
+
+        assert pr.get_files_calls == 1
+        if isinstance(failure, _ExplodingIterable):
+            assert failure.iteration_calls == 1
+        assert provider.git_files is None
+        assert "git_files" not in request_context
+
+    @pytest.mark.parametrize(
+        "failure",
+        [RequestsConnectionError("request failed"),
+         _ExplodingIterable(RequestsConnectionError("page failed"))],
     )
     def test_file_collection_errors_propagate_after_retry_without_caching(self, monkeypatch, failure):
         request_context = _set_request_context(monkeypatch)
         pr = _FakePullRequest(failure, 1)
         provider = _make_provider_for_file_collection(pr)
 
-        with pytest.raises(RuntimeError) as raised:
+        with pytest.raises(RequestsConnectionError) as raised:
             provider.get_files()
 
         expected_error = failure.error if isinstance(failure, _ExplodingIterable) else failure
@@ -677,7 +844,7 @@ class TestCompletePullRequestFiles:
     def test_transient_file_request_recovers_and_populates_caches(self, monkeypatch):
         request_context = _set_request_context(monkeypatch)
         files = ["first"]
-        pr = _SequencedFilesPullRequest([RuntimeError("request failed"), files], len(files))
+        pr = _SequencedFilesPullRequest([RequestsConnectionError("request failed"), files], len(files))
         provider = _make_provider_for_file_collection(pr)
 
         assert provider.get_files() == files
@@ -688,7 +855,7 @@ class TestCompletePullRequestFiles:
     def test_transient_materialization_error_recovers_and_populates_caches(self, monkeypatch):
         request_context = _set_request_context(monkeypatch)
         files = ["first"]
-        iterable = _TransientIterable(RuntimeError("page failed"), files)
+        iterable = _TransientIterable(RequestsConnectionError("page failed"), files)
         pr = _FakePullRequest(iterable, len(files))
         provider = _make_provider_for_file_collection(pr)
 
@@ -701,18 +868,21 @@ class TestCompletePullRequestFiles:
     def test_transient_changed_files_error_recovers_and_populates_caches(self, monkeypatch):
         request_context = _set_request_context(monkeypatch)
         files = ["first"]
-        pr = _SequencedChangedFilesPullRequest(files, [RuntimeError("metadata failed"), len(files)])
+        pr = _SequencedChangedFilesPullRequest(
+            files, [RequestsConnectionError("metadata failed"), len(files), len(files)]
+        )
         provider = _make_provider_for_file_collection(pr)
 
         assert provider.get_files() == files
-        assert pr.get_files_calls == 2
-        assert pr.changed_files_calls == 2
+        assert pr.get_files_calls == 1
+        assert pr.changed_files_calls == 3
+        provider._get_pr.assert_called_once()
         assert provider.git_files == files
         assert request_context["git_files"] == files
 
     def test_transient_failure_then_mismatch_fails_closed_without_caching(self, monkeypatch):
         request_context = _set_request_context(monkeypatch)
-        pr = _SequencedFilesPullRequest([RuntimeError("request failed"), ["first"]], 2)
+        pr = _SequencedFilesPullRequest([RequestsConnectionError("request failed"), ["first"]], 2)
         provider = _make_provider_for_file_collection(pr)
 
         with pytest.raises(IncompletePullRequestFilesError):
@@ -726,7 +896,7 @@ class TestCompletePullRequestFiles:
         _set_request_context(monkeypatch)
         file = _make_file("first.py", "modified")
         provider = _make_provider_for_diff([file])
-        provider.pr.get_files = Mock(side_effect=[RuntimeError("request failed"), [file]])
+        provider.pr.get_files = Mock(side_effect=[RequestsConnectionError("request failed"), [file]])
         provider._get_pr_file_content = lambda file, sha, path=None: "content"
 
         diffs = provider.get_diff_files()
@@ -832,3 +1002,223 @@ class TestCompletePullRequestFiles:
         assert isinstance(files, list)
         assert pr.get_files_calls == 0
         assert pr.changed_files_calls == 0
+
+
+class _RevisionRequester:
+    base_url = "https://api.github.test"
+    per_page = 30
+    is_not_lazy = False
+
+    def __init__(self, moved_field=None):
+        self.marker = {"head": "head-a", "base": "base-a", "ref": "main", "count": 31}
+        self.moved_field = moved_field
+        self.page_reads = []
+        self.metadata_reads = 0
+
+    def pull_data(self):
+        return {
+            "url": f"{self.base_url}/repos/example/project/pulls/7",
+            "number": 7,
+            "head": {"sha": self.marker["head"]},
+            "base": {"sha": self.marker["base"], "ref": self.marker["ref"]},
+            "changed_files": self.marker["count"],
+        }
+
+    def requestJsonAndCheck(self, method, url, parameters=None, headers=None, **kwargs):  # noqa: N802
+        assert method == "GET"
+        if url.endswith("/pulls/7"):
+            self.metadata_reads += 1
+            return {}, self.pull_data()
+        assert "/pulls/7/files" in url
+        page = 2 if "page=2" in url else 1
+        self.page_reads.append(page)
+        if page == 2:
+            if self.moved_field:
+                self.marker[self.moved_field] = 32 if self.moved_field == "count" else "revision-private"
+            return {}, [{"filename": "page-two.py", "status": "modified"}]
+        return {"link": f'<{url}?page=2>; rel="next"'}, [
+            {"filename": f"page-one-{index}.py", "status": "modified"} for index in range(30)
+        ]
+
+
+def _sdk_revision_provider(moved_field=None):
+    requester = _RevisionRequester(moved_field)
+    pr = PullRequest(requester, {}, requester.pull_data(), completed=True)
+    provider = _make_provider_for_file_collection(pr)
+    provider.repo = "example/project"
+    provider.pr_num = 7
+    provider.repo_obj = Repository(
+        requester, {}, {"url": f"{requester.base_url}/repos/example/project", "full_name": provider.repo},
+        completed=True,
+    )
+    del provider._get_pr  # Exercise Repository.get_pull and the lazy fresh PullRequest read.
+    return provider, requester
+
+
+@pytest.mark.parametrize("moved_field", ["head", "base", "ref", "count"])
+def test_sdk_equal_length_pages_reject_revision_drift_without_caching(monkeypatch, moved_field):
+    request_context = _set_request_context(monkeypatch)
+    provider, requester = _sdk_revision_provider(moved_field)
+    original_pr = provider.pr
+
+    with pytest.raises(IncompletePullRequestFilesError) as raised:
+        provider.get_files()
+
+    assert "revision-private" not in str(raised.value)
+    assert requester.page_reads == [1, 2]
+    assert requester.metadata_reads == 1
+    assert provider.pr is original_pr
+    assert provider.git_files is None
+    assert "git_files" not in request_context
+
+
+def test_sdk_stable_pages_cache_after_one_fresh_metadata_read(monkeypatch):
+    request_context = _set_request_context(monkeypatch)
+    provider, requester = _sdk_revision_provider()
+    original_pr = provider.pr
+
+    files = provider.get_files()
+
+    assert len(files) == 31
+    assert files[-1].filename == "page-two.py"
+    assert requester.page_reads == [1, 2]
+    assert requester.metadata_reads == 1
+    assert provider.git_files is files
+    assert request_context["git_files"] is files
+    assert provider.get_pr_file_paths() is files
+    assert provider.pr is original_pr
+    assert requester.metadata_reads == 1
+    assert requester.page_reads == [1, 2]
+
+
+
+def test_sdk_collects_230_pr_files_in_three_large_pages(monkeypatch):
+    _set_request_context(monkeypatch)
+    requester = Mock(per_page=100, is_not_lazy=False)
+    pr_url = "https://api.github.com/repos/example/project/pulls/7"
+    files_url = f"{pr_url}/files"
+    all_files = [{"filename": f"file-{index}.py", "status": "modified"} for index in range(230)]
+
+    def fetch_page(method, url, parameters=None, headers=None):
+        assert method == "GET"
+        query = dict(parse_qsl(urlsplit(url).query))
+        query.update(parameters or {})
+        assert int(query["per_page"]) == 100
+        page = int(query.get("page", 1))
+        offset = (page - 1) * 100
+        links = {"link": f'<{files_url}?per_page=100&page={page + 1}>; rel="next"'} if page < 3 else {}
+        return links, all_files[offset:offset + 100]
+
+    requester.requestJsonAndCheck.side_effect = fetch_page
+    pr = PullRequest(requester, {}, {
+        "url": pr_url,
+        "head": {"sha": "head"},
+        "base": {"sha": "base", "ref": "main"},
+        "changed_files": len(all_files),
+    }, completed=True)
+    provider = _make_provider_for_file_collection(pr)
+
+    files = provider.get_files()
+
+    assert [file.filename for file in files] == [file["filename"] for file in all_files]
+    assert requester.requestJsonAndCheck.call_count == 3
+    assert provider.get_pr_file_paths() is files
+    assert requester.requestJsonAndCheck.call_count == 3
+
+
+@pytest.mark.parametrize("field,value", [
+    ("head", None), ("head", ""), ("base", None), ("ref", ""),
+    ("count", None), ("count", True), ("count", "1"), ("count", -1),
+])
+@pytest.mark.parametrize("when", ["original", "fresh"])
+def test_invalid_revision_metadata_does_not_enter_caches(monkeypatch, field, value, when):
+    request_context = _set_request_context(monkeypatch)
+    pr = _FakePullRequest(["first"], 1)
+    fresh = _FakePullRequest(["first"], 1)
+    target = pr if when == "original" else fresh
+    if field == "head":
+        target.head.sha = value
+    elif field == "base":
+        target.base.sha = value
+    elif field == "ref":
+        target.base.ref = value
+    else:
+        target.changed_files = value
+    provider = _make_provider_for_file_collection(pr)
+    provider._get_pr.return_value = fresh
+
+    with pytest.raises(IncompletePullRequestFilesError):
+        provider.get_files()
+
+    assert pr.get_files_calls == (0 if when == "original" else 1)
+    assert provider._get_pr.call_count == (0 if when == "original" else 1)
+    assert provider.git_files is None
+    assert "git_files" not in request_context
+
+
+def test_post_read_failure_recovers_within_the_same_two_attempts(monkeypatch):
+    request_context = _set_request_context(monkeypatch)
+    pr = _FakePullRequest(["first"], 1)
+    provider = _make_provider_for_file_collection(pr)
+    provider._get_pr.side_effect = [RequestsConnectionError("metadata request failed"), pr]
+
+    assert provider.get_files() == ["first"]
+    assert pr.get_files_calls == 2
+    assert provider._get_pr.call_count == 2
+    assert request_context["git_files"] == ["first"]
+
+
+def test_page_and_post_read_failure_share_the_two_attempt_budget(monkeypatch):
+    request_context = _set_request_context(monkeypatch)
+    pr = _SequencedFilesPullRequest([RequestsConnectionError("page failed"), ["first"]], 1)
+    provider = _make_provider_for_file_collection(pr)
+    provider._get_pr.side_effect = RequestsConnectionError("metadata request failed")
+
+    with pytest.raises(RequestsConnectionError, match="metadata request failed"):
+        provider.get_files()
+
+    assert pr.get_files_calls == 2
+    provider._get_pr.assert_called_once()
+    assert provider.git_files is None
+    assert "git_files" not in request_context
+
+
+def test_retry_does_not_adopt_a_marker_changed_after_first_capture(monkeypatch):
+    request_context = _set_request_context(monkeypatch)
+    pr = _FakePullRequest(["first"], 1)
+    provider = _make_provider_for_file_collection(pr)
+
+    def fresh_read():
+        if provider._get_pr.call_count == 1:
+            pr.head.sha = "moved-head"
+            raise RequestsConnectionError("metadata request failed")
+        return pr
+
+    provider._get_pr.side_effect = fresh_read
+    with pytest.raises(IncompletePullRequestFilesError):
+        provider.get_files()
+
+    assert pr.get_files_calls == 2
+    assert provider._get_pr.call_count == 2
+    assert provider.git_files is None
+    assert "git_files" not in request_context
+
+
+@pytest.mark.parametrize("error", [
+    RateLimitExceededException(403, {"message": "rate limited"}, None),
+    GithubException(429, {"message": "rate limited"}, None),
+])
+def test_post_read_rate_limit_propagates_immediately(monkeypatch, error):
+    request_context = _set_request_context(monkeypatch)
+    pr = _FakePullRequest(["first"], 1)
+    provider = _make_provider_for_file_collection(pr)
+    provider._get_pr.side_effect = error
+
+    with pytest.raises(type(error)) as raised:
+        provider.get_files()
+
+    assert raised.value is error
+    assert pr.get_files_calls == 1
+    provider._get_pr.assert_called_once()
+    assert provider.git_files is None
+    assert "git_files" not in request_context

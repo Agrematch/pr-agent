@@ -29,6 +29,7 @@ _DEFAULT_MAX_GLOB_MATCHES = 20
 # .pr_agent.toml may set the value.
 _HARD_MAX_GLOB_MATCHES = 100
 _REPO_CONTEXT_CACHE_MISS = object()
+_COMMIT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 _unsupported_repo_context_provider_classes = set()
 
 
@@ -96,7 +97,9 @@ def _get_repo_context_process_cache_key(
     except Exception:
         pr_url = getattr(git_provider, "pr_url", None)
 
-    if not pr_url:
+    # A branch name keeps its value while the branch moves, so only a commit SHA may key an
+    # entry that outlives this provider instance.
+    if not pr_url or not (isinstance(context_ref, str) and _COMMIT_SHA_PATTERN.fullmatch(context_ref)):
         return None
 
     return type(git_provider).__name__, pr_url, _get_repo_context_cache_key(
@@ -342,25 +345,37 @@ def _load_first_available_alternative(
     return [], had_fetch_error
 
 
-def _load_repo_context_files(
-    git_provider, context_files: list, from_default_branch: bool | None = None
-) -> tuple[list[tuple[str, str]], bool]:
+class _RepoContextLoadState:
+    def __init__(self):
+        self.had_fetch_error = False
+        self.had_content = False
+
+
+def _iter_repo_context_files(
+    git_provider, context_files: list, from_default_branch: bool | None = None, *, state=None
+):
+    if state is None:
+        state = _RepoContextLoadState()
     if from_default_branch is None:
         from_default_branch = _read_bool_setting("repo_context_from_default_branch", default=True)
-    context_files, had_fetch_error = _expand_glob_entries(git_provider, context_files, from_default_branch)
+    context_files, glob_had_fetch_error = _expand_glob_entries(git_provider, context_files, from_default_branch)
+    state.had_fetch_error = state.had_fetch_error or glob_had_fetch_error
     # Ordered (label, content) entries rather than a label-keyed dict: a local path can equal a
     # sibling's rendered label, and a label-keyed mapping would silently drop one of them.
-    files = []
     max_siblings = _read_max_sibling_context_files()
     sibling_fetch_attempts = 0
     seen_sibling_pairs = set()
+    seen_local_paths = set()
     for entry in context_files:
         if isinstance(entry, list):
             group_files, group_had_fetch_error = _load_first_available_alternative(
                 git_provider, entry, from_default_branch)
-            had_fetch_error = had_fetch_error or group_had_fetch_error
-            loaded_labels = {label for label, _ in files}
-            files.extend(item for item in group_files if item[0] not in loaded_labels)
+            state.had_fetch_error = state.had_fetch_error or group_had_fetch_error
+            for label, content in group_files:
+                if label not in seen_local_paths:
+                    seen_local_paths.add(label)
+                    state.had_content = True
+                    yield label, content
             continue
         repo_id, file_path = _parse_repo_context_file_entry(entry)
         if not file_path:
@@ -397,7 +412,7 @@ def _load_repo_context_files(
             try:
                 content = git_provider.get_sibling_repo_file_content(repo_id, file_path)
             except Exception:
-                had_fetch_error = True
+                state.had_fetch_error = True
                 # A sibling fetch can fail after the provider resolved ids, so keep the full
                 # traceback; a flat warning hides which request failed and why.
                 get_logger().exception(
@@ -407,6 +422,10 @@ def _load_repo_context_files(
             # Render the file under its sibling path so the model sees where it came from.
             label = f"{repo_id}/{file_path}"
         else:
+            if file_path in seen_local_paths:
+                get_logger().debug(f"Skipping duplicate local repo context file: {file_path}")
+                continue
+            seen_local_paths.add(file_path)
             if isinstance(entry, str) and _SIBLING_REPO_SEPARATOR in entry:
                 # A ':' inside a plain local path used to read as a sibling entry. Structured
                 # {"repo_id", "file_path"} dicts are the only sibling form now, so hint at the
@@ -420,7 +439,7 @@ def _load_repo_context_files(
             try:
                 content = git_provider.get_repo_file_content(file_path, from_default_branch=from_default_branch)
             except Exception as e:
-                had_fetch_error = True
+                state.had_fetch_error = True
                 get_logger().warning(f"Failed to load repo context file: {file_path}", artifact={"error": str(e)})
                 continue
             label = file_path
@@ -432,9 +451,21 @@ def _load_repo_context_files(
         if isinstance(content, bytes):
             content = content.decode("utf-8", errors="replace")
 
-        files.append((label, str(content).rstrip()))
+        state.had_content = True
+        yield label, str(content).rstrip()
 
-    return files, had_fetch_error
+
+def _load_repo_context_files(
+    git_provider, context_files: list, from_default_branch: bool | None = None
+) -> tuple[list[tuple[str, str]], bool]:
+    """Load every configured file for compatibility callers."""
+    state = _RepoContextLoadState()
+    files = list(
+        _iter_repo_context_files(
+            git_provider, context_files, from_default_branch, state=state
+        )
+    )
+    return files, state.had_fetch_error
 
 
 def _repo_context_render_entries(files):
@@ -506,6 +537,11 @@ def render_instruction_files_with_line_budget(
 
         parts.extend(file_footer)
 
+        # Stop before advancing a lazy iterator when even an empty next file cannot fit.
+        minimum_next_file_lines = len(file_header) + len(file_footer) + 1
+        if max_lines - len(parts) < minimum_next_file_lines:
+            break
+
     parts.append(closing_tag)
     return "\n".join(parts).strip()
 
@@ -546,12 +582,16 @@ def build_repo_context(git_provider) -> str:
         if cached_repo_context is not _REPO_CONTEXT_CACHE_MISS:
             return cached_repo_context
 
-    files, had_fetch_error = _load_repo_context_files(git_provider, context_files, from_default_branch)
+    load_state = _RepoContextLoadState()
+    files = _iter_repo_context_files(
+        git_provider, context_files, from_default_branch, state=load_state
+    )
+    repo_context = render_instruction_files_with_line_budget(files, max_lines)
+    if not load_state.had_content:
+        repo_context = ""
 
-    repo_context = render_instruction_files_with_line_budget(files, max_lines) if files else ""
-
-    # Only cache when every file was fetched successfully. A transient/unexpected fetch error must
-    # not be cached as a real result, so it is retried instead of being served until the TTL expires.
-    if not had_fetch_error and not has_sibling_entries:
+    # Cache only when every file that can affect the rendered result was fetched successfully.
+    # Leave files beyond the line budget unread.
+    if not load_state.had_fetch_error and not has_sibling_entries:
         _store_repo_context(git_provider, context_files, max_lines, context_ref, repo_context)
     return repo_context

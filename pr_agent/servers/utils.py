@@ -5,9 +5,10 @@ import re
 import secrets
 import time
 from collections import defaultdict
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable, Sequence
+from typing import Any
 
 from fastapi import HTTPException
 
@@ -25,7 +26,7 @@ _PLAIN_PR_COMMANDS = ("/describe", "/review", "/improve")
 _COMMITTABLE_PR_COMMANDS = (
     "/describe --pr_description.final_update_message=false",
     "/review",
-    "/improve --pr_code_suggestions.commitable_code_suggestions=true",
+    "/improve --pr_code_suggestions.committable_code_suggestions=true",
 )
 _DEFAULT_PR_COMMANDS_BY_PROVIDER = {
     "github_app": _STANDARD_PR_COMMANDS,
@@ -36,6 +37,48 @@ _DEFAULT_PR_COMMANDS_BY_PROVIDER = {
     "bitbucket_server": _COMMITTABLE_PR_COMMANDS,
 }
 _MISSING = object()
+
+
+def payload_log_summary(data: object, identifying_fields: Sequence[str] = ()) -> dict:
+    """Return a webhook payload's top-level keys and identifying string fields, never its values."""
+    if not isinstance(data, dict):
+        return {"payload_type": type(data).__name__}
+
+    summary = {"payload_keys": sorted(data.keys())}
+    for name in identifying_fields:
+        value = data.get(name)
+        if isinstance(value, str):
+            summary[name] = value
+    return summary
+
+
+def is_command_comment(body) -> bool:
+    """Return True when a comment body is a slash-command comment.
+
+    A command comment must start with '/' after leading whitespace, matching the
+    check the GitHub app and action already apply. Plain sentences that merely
+    begin with a command word ("review looks good to me") must not dispatch a
+    tool, because the dispatcher strips an optional leading slash.
+    """
+    return isinstance(body, str) and body.lstrip().startswith("/")
+
+
+def is_ask_command_comment(body) -> bool:
+    """Return True when a comment body starts with the /ask command.
+
+    Match the command token, not a bare prefix the way ``str.startswith`` would.
+    A line comment such as "/asking about retries" is not an ask command: the
+    dispatcher rejects the unknown "/asking" command, but prefix matching would
+    instead rewrite the comment into an /ask_line question whose text is
+    "ing about retries". "/ask_line" is the generated command name, so it is
+    accepted as well.
+    """
+    if not isinstance(body, str):
+        return False
+    stripped = body.lstrip()
+    if not stripped:
+        return False
+    return stripped.split(maxsplit=1)[0] in ("/ask", "/ask_line")
 
 
 def get_pr_commands(provider: str) -> Sequence[str]:

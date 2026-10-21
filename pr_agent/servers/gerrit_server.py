@@ -1,9 +1,9 @@
 import copy
-from enum import Enum
+from enum import StrEnum
 from json import JSONDecodeError
 
 import uvicorn
-from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from starlette.middleware import Middleware
@@ -14,6 +14,7 @@ from pr_agent.agent.pr_agent import PRAgent
 from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.git_providers.gerrit_provider import GerritProvider
 from pr_agent.log import get_logger, setup_logger
+from pr_agent.servers.request_body_limit import create_server_app
 from pr_agent.servers.utils import basic_auth_matches
 
 setup_logger()
@@ -46,12 +47,11 @@ def authorize(credentials: HTTPBasicCredentials = Depends(security)):  # noqa: B
         )
 
 
-class Action(str, Enum):
+class Action(StrEnum):
     review = "review"
     describe = "describe"
     ask = "ask"
     improve = "improve"
-    reflect = "reflect"
     answer = "answer"
 
 
@@ -127,7 +127,7 @@ def start():
     # to prevent adding help messages with the output
     get_settings().set("CONFIG.CLI_MODE", True)
     middleware = [Middleware(RawContextMiddleware)]
-    app = FastAPI(middleware=middleware)
+    app = create_server_app(middleware=middleware)
     app.include_router(router)
 
     uvicorn.run(app, host="0.0.0.0", port=3000)

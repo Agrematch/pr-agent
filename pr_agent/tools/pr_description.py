@@ -4,18 +4,19 @@ import re
 import traceback
 from functools import partial
 from graphlib import TopologicalSorter
-from typing import List, Tuple
 
 import yaml
 from pydantic import ValidationError
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+from pr_agent.algo.artifacts import get_artifact_context
 from pr_agent.algo.comment_identity import PRDescriptionHeader
 from pr_agent.algo.output_models import PRDescriptionAssembled
 from pr_agent.algo.pr_processing import (
     OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD,
     FallbackEligibleError,
+    append_filtered_file_names,
     get_pr_diff,
     get_pr_diff_multiple_patchs,
     retry_with_fallback_models,
@@ -28,21 +29,24 @@ from pr_agent.algo.token_budget import AttemptTokenBudget
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import (
     ModelType,
+    filter_generated_labels,
     get_user_labels,
     load_yaml,
     set_custom_labels,
 )
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import get_git_provider_with_context
-from pr_agent.git_providers.git_provider import get_main_pr_language
+from pr_agent.git_providers.git_provider import IncompleteProviderPullRequestFilesError, get_main_pr_language
 from pr_agent.log import get_logger
 from pr_agent.servers.help import HelpMessage
+from pr_agent.tools.progress_comment import ChunkProgressReporter
 from pr_agent.tools.ticket_pr_compliance_check import (
     extract_and_cache_pr_tickets,
     fit_related_tickets_to_prompt_budget,
 )
 
 MAX_DESCRIPTION_COVERAGE_FILES = 50
+DESCRIBE_PROGRESS_COMMENT = "Preparing PR description..."
 
 
 def _build_unprocessed_files_block(file_list: list, label: str, max_files: int = 50) -> str:
@@ -99,6 +103,7 @@ class PRDescription:
             "language": self.main_pr_language,
             "diff": "",  # empty diff for initial calculation
             "extra_instructions": get_settings().pr_description.extra_instructions,
+            "artifact_context": get_artifact_context("pr_description"),
             "skills_context": get_skills_context(),
             "repo_context": build_repo_context(self.git_provider),
             "commit_messages_str": self.git_provider.get_commit_messages(),
@@ -132,15 +137,15 @@ class PRDescription:
 
     async def run(self):
         init_run_details()
-        progress_response = None
+        self.progress_response = None
         try:
             get_logger().info(f"Generating a PR description for pr_id: {self.pr_id}")
             relevant_configs = {'pr_description': dict(get_settings().pr_description),
                                 'config': dict(get_settings().config)}
             get_logger().debug("Relevant configs", artifact=relevant_configs)
             if get_settings().config.publish_output and not get_settings().config.get('is_auto_command', False):
-                progress_response = self.git_provider.publish_comment(
-                    "Preparing PR description...", is_temporary=True)
+                self.progress_response = self.git_provider.publish_comment(
+                    DESCRIBE_PROGRESS_COMMENT, is_temporary=True)
 
             # ticket extraction if exists
             await extract_and_cache_pr_tickets(self.git_provider, self.vars)
@@ -213,7 +218,7 @@ class PRDescription:
             if get_settings().config.publish_output:
                 # Emit to the optional external sinks before touching the provider, so a sink
                 # still receives the description if publishing it to the PR fails.
-                push_outputs("describe", payload=self.data or {}, markdown=pr_body)
+                push_outputs("describe", payload=self._prepare_output_payload(), markdown=pr_body)
 
                 # publish labels
                 if (
@@ -222,15 +227,22 @@ class PRDescription:
                     and self.git_provider.is_supported("get_labels")
                 ):
                     original_labels = self.git_provider.get_pr_labels(update=True)
-                    get_logger().debug("original labels", artifact=original_labels)
-                    user_labels = get_user_labels(original_labels)
-                    new_labels = pr_labels + user_labels
-                    get_logger().debug("published labels", artifact=new_labels)
-                    if set(new_labels) != set(original_labels):
-                        get_logger().info(f"Setting describe labels:\n{new_labels}")
-                        self.git_provider.publish_labels(new_labels)
+                    if original_labels is None:
+                        # The read failed with no snapshot to fall back on. publish_labels
+                        # replaces the whole set, so publishing would delete human labels.
+                        get_logger().error(
+                            "Skipping label publish: existing labels could not be read, "
+                            "and publishing would remove them")
                     else:
-                        get_logger().debug("Labels are the same, not updating")
+                        get_logger().debug("original labels", artifact=original_labels)
+                        user_labels = get_user_labels(original_labels)
+                        new_labels = pr_labels + user_labels
+                        get_logger().debug("published labels", artifact=new_labels)
+                        if set(new_labels) != set(original_labels):
+                            get_logger().info(f"Setting describe labels:\n{new_labels}")
+                            self.git_provider.publish_labels(new_labels)
+                        else:
+                            get_logger().debug("Labels are the same, not updating")
 
                 # publish description
                 if get_settings().pr_description.publish_description_as_comment:
@@ -267,14 +279,19 @@ class PRDescription:
                         get_settings().pr_description.final_update_message
                         and not get_settings().config.get('is_auto_command', False)
                     ):
-                        latest_commit_url = self.git_provider.get_latest_commit_url()
-                        if latest_commit_url:
-                            pr_url = self.git_provider.get_pr_url()
-                            update_comment = (
-                                f"**[PR Description]({pr_url})** "
-                                f"updated to latest commit ({latest_commit_url})"
+                        try:
+                            latest_commit_url = self.git_provider.get_latest_commit_url()
+                            if latest_commit_url:
+                                pr_url = self.git_provider.get_pr_url()
+                                update_comment = (
+                                    f"**[PR Description]({pr_url})** "
+                                    f"updated to latest commit ({latest_commit_url})"
+                                )
+                                self.git_provider.publish_comment(update_comment)
+                        except Exception as feedback_error:
+                            get_logger().exception(
+                                f"PR description updated, but final update message failed: {feedback_error}"
                             )
-                            self.git_provider.publish_comment(update_comment)
             else:
                 get_logger().info('PR description, but not published since publish_output is False.')
                 get_settings().data = {"artifact": pr_body}
@@ -284,19 +301,22 @@ class PRDescription:
                                artifact={"traceback": traceback.format_exc()})
             # The status of the whole run must not read as success just because the error stopped here.
             record_command_failure()
-            if get_settings().config.get("propagate_tool_errors", False):
+            if (
+                isinstance(e, IncompleteProviderPullRequestFilesError)
+                or get_settings().config.get("propagate_tool_errors", False)
+            ):
                 raise
         finally:
-            if progress_response is not None:
+            if self.progress_response is not None:
                 try:
                     self.git_provider.edit_comment(
-                        progress_response, "PR description generation finished.")
+                        self.progress_response, "PR description generation finished.")
                 except Exception as e:
                     get_logger().exception(
                         f"Failed to update PR description progress comment, "
                         f"error: {e}")
                 try:
-                    self.git_provider.remove_comment(progress_response)
+                    self.git_provider.remove_comment(self.progress_response)
                 except Exception as e:
                     get_logger().exception(
                         f"Failed to remove PR description progress comment, error: {e}")
@@ -307,6 +327,12 @@ class PRDescription:
         self.description_total_chunk_count = 0
         self.description_failed_chunk_count = 0
         self.description_failed_files = []
+        previous_progress = getattr(self, "_chunk_progress", None)
+        if previous_progress is not None:
+            # A fallback-model retry starts over, whatever path it takes next; restore the
+            # placeholder so a failing attempt's counts are not shown until new ones exist.
+            await previous_progress.reset_to_base()
+        self._chunk_progress = None
         if get_settings().pr_description.use_description_markers and 'pr_agent:' not in self.user_description:
             get_logger().info(
                 "Markers were enabled, but user description does not contain "
@@ -364,11 +390,17 @@ class PRDescription:
                     patches_diff,
                     prompt="pr_description_prompt",
                 )
+                self._require_usable_prediction(self.prediction)
 
                 # extend the prediction with additional files not shown
                 if get_settings().pr_description.enable_semantic_files_types:
                     self.prediction = await self.extend_uncovered_files(self.prediction)
             else:
+                if not remaining_files_list:
+                    # No diff and nothing left unprocessed: every changed file was filtered out
+                    # (lockfile, asset, ignore rule), so skip instead of failing the command.
+                    get_logger().info(f"PR has no analyzable files: {self.pr_id}, skipping describe")
+                    return None
                 get_logger().error(f"Error getting PR diff {self.pr_id}",
                                    artifact={"traceback": traceback.format_exc()})
                 raise FallbackEligibleError(
@@ -397,10 +429,17 @@ class PRDescription:
                 **output_token_reserve_kwargs,
             )
 
+            if not any(patches_compressed_list) and not remaining_files_list:
+                # No chunk holds diff content and nothing was left unprocessed, so there is
+                # nothing to describe. Skip the model chain instead of failing the command.
+                get_logger().info(f"PR has no analyzable files: {self.pr_id}, skipping describe")
+                return None
+
             # get the files prediction for each patch
             chunk_pairs = list(zip(patches_compressed_list, files_in_patches_list, strict=True))
             self.description_total_chunk_count = len(chunk_pairs)
             results = [None] * len(chunk_pairs)
+            progress = self._chunk_progress = self._chunk_progress_reporter(total=len(chunk_pairs))
             if not get_settings().pr_description.get("async_ai_calls", True):
                 for i, (patches, _files_in_patch) in enumerate(chunk_pairs):  # sync calls
                     if not patches:
@@ -408,10 +447,8 @@ class PRDescription:
                     patches_diff = "\n".join(patches)
                     get_logger().debug(f"PR diff number {i + 1} for describe files")
                     try:
-                        results[i] = await self._get_prediction(
-                            model,
-                            patches_diff,
-                            prompt="pr_description_only_files_prompts",
+                        results[i] = await self._describe_chunk(
+                            progress, model, patches_diff,
                         )
                     except Exception as e:
                         results[i] = e
@@ -423,10 +460,10 @@ class PRDescription:
                         patches_diff = "\n".join(patches)
                         get_logger().debug(f"PR diff number {i + 1} for describe files")
                         task = asyncio.create_task(
-                            self._get_prediction(
+                            self._describe_chunk(
+                                progress,
                                 model,
                                 patches_diff,
-                                prompt="pr_description_only_files_prompts",
                             )
                         )
                         tasks.append(task)
@@ -485,6 +522,9 @@ class PRDescription:
 
             self.description_failed_chunk_count = len(chunk_pairs) - len(file_description_str_list)
             self.description_failed_files = list(dict.fromkeys(failed_files))
+            progress = getattr(self, "_chunk_progress", None)
+            if progress is not None and self.description_failed_chunk_count > 0:
+                await progress.set_failed(self.description_failed_chunk_count)
             if not file_description_str_list:
                 raise chunk_errors[0] if chunk_errors else FallbackEligibleError("No description chunks were generated")
 
@@ -512,11 +552,29 @@ class PRDescription:
                 files_walkthrough_prompt += _build_unprocessed_files_block(
                     deleted_files_list, "Additional deleted files:",
                     max_files=MAX_EXTRA_FILES_TO_PROMPT)
+            filtered_files = getattr(self.git_provider, "get_filtered_diff_file_names", lambda: [])()
+            if isinstance(filtered_files, (list, tuple)) and filtered_files:
+                header_budget = AttemptTokenBudget.for_attempt(
+                    model, token_handler_only_description_prompt,
+                    output_token_reserve=output_token_reserve,
+                )
+                files_walkthrough_prompt = append_filtered_file_names(
+                    files_walkthrough_prompt,
+                    self.git_provider,
+                    header_budget.token_handler,
+                    header_budget.token_handler.prompt_tokens + header_budget.available_tokens(
+                        OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD, preserve_minimum=True, clamp=False,
+                    ),
+                )
             # PR header inference
             get_logger().debug("PR diff only description", artifact=files_walkthrough_prompt)
             prediction_headers = await self._get_prediction(model, patches_diff=files_walkthrough_prompt,
                                                             prompt="pr_description_only_description_prompts")
-            prediction_headers = prediction_headers.strip().removeprefix('```yaml').strip('`').strip()
+            if isinstance(prediction_headers, str):
+                prediction_headers = re.sub(
+                    r'^```[ \t]*(?:(?i:yaml|yml)[ \t]*)?(?=\r?\n)', '', prediction_headers.strip()
+                ).strip('`').strip()
+            self._require_usable_prediction(prediction_headers)
 
             # extend the tables with the files not shown
             files_walkthrough_extended = await self.extend_uncovered_files(files_walkthrough)
@@ -622,6 +680,47 @@ class PRDescription:
             return original_prediction
 
 
+    def _describe_progress_body(self, line: str) -> str:
+        """Render the temporary description placeholder plus the current chunk progress line."""
+        return f"{DESCRIBE_PROGRESS_COMMENT} {line}" if line else DESCRIBE_PROGRESS_COMMENT
+
+    def _chunk_progress_reporter(self, total: int) -> ChunkProgressReporter | None:
+        """Report chunk progress by rewriting the temporary description comment in place.
+
+        A large-PR describe run makes one model call per file chunk, which can take
+        minutes, so the placeholder is kept current. Returns None when the comment
+        cannot be edited back (output-only providers) or when progress reporting is
+        turned off, which leaves the run with today's frozen placeholder.
+        """
+        comment = getattr(self, "progress_response", None)
+        settings = get_settings()
+        # A single chunk has nothing to report: one "1 of 1" edit is a provider
+        # write with no information, so skip the reporter like /improve does.
+        # A missing comment falls through: create() then serves the check-run
+        # sink alone, which is the only progress channel automatic commands have.
+        if total < 2 or not settings.config.get("publish_output_progress", True):
+            return None
+        return ChunkProgressReporter.create(
+            self.git_provider,
+            comment,
+            DESCRIBE_PROGRESS_COMMENT,
+            total=total,
+            body_builder=self._describe_progress_body,
+            label="description",
+        )
+
+    async def _describe_chunk(self, progress, model: str, patches_diff: str) -> str:
+        """Describe one file chunk, then advance the in-place progress comment it runs under."""
+        try:
+            return await self._get_prediction(
+                model,
+                patches_diff,
+                prompt="pr_description_only_files_prompts",
+            )
+        finally:
+            if progress is not None:
+                await progress.record_settled()
+
     async def _get_prediction(
         self,
         model: str,
@@ -674,12 +773,19 @@ class PRDescription:
 
         return response
 
+    def _require_usable_prediction(self, prediction: str) -> None:
+        parsed = load_yaml(prediction.strip(), keys_fix_yaml=self.keys_fix) if isinstance(prediction, str) else None
+        if not isinstance(parsed, dict) or not parsed:
+            raise FallbackEligibleError("The /describe model returned no usable YAML mapping")
+
     def _prepare_data(self):
         # Load the AI prediction data into a dictionary
         self.data = load_yaml(self.prediction.strip(), keys_fix_yaml=self.keys_fix)
         self._validate_description_schema(self.data)
 
-        if get_settings().pr_description.add_original_user_description and self.user_description:
+        # A separate comment leaves the PR body untouched, so repeating the user text would duplicate it.
+        if (get_settings().pr_description.add_original_user_description and self.user_description
+                and not get_settings().pr_description.publish_description_as_comment):
             self.data["User Description"] = self.user_description
 
         # re-order keys
@@ -720,7 +826,19 @@ class PRDescription:
             return False
         return True
 
-    def _prepare_labels(self) -> List[str]:
+    def _prepare_output_payload(self) -> dict:
+        """Filter generated label fields for external sinks without mutating model data."""
+        payload = dict(self.data or {})
+        for field in ("labels", "type"):
+            if field not in payload:
+                continue
+            values = payload[field]
+            if isinstance(values, str):
+                values = values.split(",")
+            payload[field] = filter_generated_labels(values if isinstance(values, list) else [])
+        return payload
+
+    def _prepare_labels(self) -> list[str]:
         pr_labels = []
 
         # If the 'PR Type' key is present in the dictionary, split its value by comma and assign it to 'pr_types'
@@ -745,9 +863,9 @@ class PRDescription:
                         pr_labels[i] = d[label_i]
         except Exception as e:
             get_logger().error(f"Error converting labels to original case {self.pr_id}: {e}")
-        return pr_labels
+        return filter_generated_labels(pr_labels)
 
-    def _prepare_pr_answer_with_markers(self) -> Tuple[str, str]:
+    def _prepare_pr_answer_with_markers(self) -> tuple[str, str]:
         get_logger().info(f"Using description marker replacements {self.pr_id}")
 
         # Remove the 'PR Title' key from the dictionary
@@ -803,7 +921,7 @@ class PRDescription:
 
         return title, body
 
-    def _prepare_pr_answer(self) -> Tuple[str, str, str]:
+    def _prepare_pr_answer(self) -> tuple[str, str, str]:
         """
         Prepare the PR description based on the AI prediction data.
 
@@ -893,26 +1011,17 @@ class PRDescription:
         for file in self.data['pr_files']:
             try:
                 required_fields = ['changes_title', 'filename', 'label']
-                if not all(field in file for field in required_fields):
+                if self.vars.get('include_file_summary_changes', True):
+                    required_fields.append('changes_summary')
+                if not all(isinstance(file.get(field), str) and file[field].strip() for field in required_fields):
                     # can happen for example if a YAML generation was interrupted in the middle (no more tokens)
                     get_logger().warning(f"Missing required fields in file label dict {self.pr_id}, skipping file",
                                          artifact={"file": file})
                     continue
-                if not file.get('changes_title'):
-                    get_logger().warning(
-                        f"Empty changes title or summary in file label dict {self.pr_id}, skipping file",
-                        artifact={"file": file},
-                    )
-                    continue
-                filename = file['filename'].replace("'", "`").replace('"', '`')
-                changes_summary = file.get('changes_summary', "")
-                if not changes_summary and self.vars.get('include_file_summary_changes', True):
-                    get_logger().warning("Empty changes summary in file label dict, skipping file",
-                                         artifact={"file": file})
-                    continue
-                changes_summary = changes_summary.strip()
+                filename = file['filename'].replace("'", "`").replace('"', "`")
+                changes_summary = (file.get('changes_summary') or "").strip()
                 changes_title = file['changes_title'].strip()
-                label = file.get('label').strip().lower()
+                label = file['label'].strip().lower()
                 if label not in file_label_dict:
                     file_label_dict[label] = []
                 file_label_dict[label].append((filename, changes_title, changes_summary))
@@ -940,6 +1049,7 @@ class PRDescription:
             # header += "&nbsp; " * delta
             pr_body += f"""<thead><tr><th></th><th align="left">{header}</th></tr></thead>"""
             pr_body += """<tbody>"""
+            diff_files_by_name = None
             for semantic_label in value.keys():
                 s_label = semantic_label.strip("'").strip('"')
                 pr_body += f"""<tr><td><strong>{s_label.capitalize()}</strong></td>"""
@@ -964,16 +1074,19 @@ class PRDescription:
                         filename_publish = f"<strong>{filename_publish}</strong>"
                     diff_plus_minus = ""
                     delta_nbsp = ""
-                    diff_files = self.git_provider.get_diff_files()
-                    for f in diff_files:
-                        if f.filename.lower().strip('/') == filename.lower().strip('/'):
-                            num_plus_lines = f.num_plus_lines
-                            num_minus_lines = f.num_minus_lines
-                            diff_plus_minus += f"+{num_plus_lines}/-{num_minus_lines}"
-                            if len(diff_plus_minus) > 12 or diff_plus_minus == "+0/-0":
-                                diff_plus_minus = "[link]"
-                            delta_nbsp = "&nbsp; " * max(0, (8 - len(diff_plus_minus)))
-                            break
+                    if diff_files_by_name is None:
+                        diff_files_by_name = {}
+                        for diff_file in self.git_provider.get_diff_files():
+                            # Preserve the first match when normalized paths collide.
+                            diff_files_by_name.setdefault(diff_file.filename.lower().strip('/'), diff_file)
+                    f = diff_files_by_name.get(filename.lower().strip('/'))
+                    if f is not None:
+                        num_plus_lines = f.num_plus_lines
+                        num_minus_lines = f.num_minus_lines
+                        diff_plus_minus += f"+{num_plus_lines}/-{num_minus_lines}"
+                        if len(diff_plus_minus) > 12 or diff_plus_minus == "+0/-0":
+                            diff_plus_minus = "[link]"
+                        delta_nbsp = "&nbsp; " * max(0, (8 - len(diff_plus_minus)))
 
                     # try to add line numbers link to code suggestions
                     link = ""
@@ -1051,7 +1164,7 @@ DIAGRAM_SQUARE_NODE_PATTERN = re.compile(
 )
 
 
-def _diagram_label_positions(line: str) -> List[bool]:
+def _diagram_label_positions(line: str) -> list[bool]:
     """For each position in the line, whether it sits inside an existing label."""
     square_depth = 0
     in_double_quotes = False
@@ -1135,7 +1248,7 @@ def _strip_diagram_labels(line: str) -> str:
     return line
 
 
-def _parse_diagram_edges(lines: List[str]) -> List[Tuple[str, str]]:
+def _parse_diagram_edges(lines: list[str]) -> list[tuple[str, str]]:
     """Extract the directed edges of a mermaid flowchart body, tolerating its syntax variants."""
     edges = []
     for raw_line in lines:
@@ -1169,7 +1282,7 @@ def _parse_diagram_edges(lines: List[str]) -> List[Tuple[str, str]]:
     return edges
 
 
-def _longest_diagram_chain(edges: List[Tuple[str, str]]) -> int:
+def _longest_diagram_chain(edges: list[tuple[str, str]]) -> int:
     """Length, in nodes, of the longest path through the graph. Raises ValueError on a cycle."""
     predecessors = {}
     for source, target in edges:

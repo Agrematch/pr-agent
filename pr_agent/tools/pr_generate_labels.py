@@ -1,6 +1,5 @@
 import copy
 from functools import partial
-from typing import List
 
 from pydantic import ValidationError
 
@@ -16,10 +15,10 @@ from pr_agent.algo.pr_processing import (
 from pr_agent.algo.run_details import record_command_failure
 from pr_agent.algo.token_budget import AttemptTokenBudget
 from pr_agent.algo.token_handler import TokenHandler
-from pr_agent.algo.utils import get_user_labels, load_yaml, set_custom_labels
+from pr_agent.algo.utils import filter_generated_labels, get_user_labels, load_yaml, set_custom_labels
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import get_git_provider
-from pr_agent.git_providers.git_provider import get_main_pr_language
+from pr_agent.git_providers.git_provider import IncompleteProviderPullRequestFilesError, get_main_pr_language
 from pr_agent.log import get_logger
 
 
@@ -90,15 +89,27 @@ class PRGenerateLabels:
                 return None
 
             pr_labels = self._prepare_labels()
+            if not pr_labels and self.data and self.data.get("labels"):
+                # Preserve existing labels when all generated values are rejected.
+                get_logger().warning("Skipping label publish: all generated labels were rejected")
+                return ""
 
             if get_settings().config.publish_output:
                 get_logger().info(f"Pushing labels {self.pr_id}")
 
                 if self.git_provider.is_supported("get_labels"):
                     current_labels = self.git_provider.get_pr_labels()
-                    user_labels = get_user_labels(current_labels)
-                    pr_labels = pr_labels + user_labels
-                    self.git_provider.publish_labels(pr_labels)
+                    if current_labels is None:
+                        # The read failed and there is no earlier snapshot to preserve user
+                        # labels from. publish_labels replaces the whole set, so publishing
+                        # now would delete every label a human added to the PR.
+                        get_logger().error(
+                            "Skipping label publish: existing labels could not be read, "
+                            "and publishing would remove them")
+                    else:
+                        user_labels = get_user_labels(current_labels)
+                        pr_labels = pr_labels + user_labels
+                        self.git_provider.publish_labels(pr_labels)
                 elif pr_labels:
                     value = ', '.join(v for v in pr_labels)
                     pr_labels_text = f"## PR Labels:\n{value}\n"
@@ -106,7 +117,10 @@ class PRGenerateLabels:
         except Exception as e:
             get_logger().error(f"Error generating PR labels {self.pr_id}: {e}")
             record_command_failure()
-            if get_settings().config.get("propagate_tool_errors", False):
+            if (
+                isinstance(e, IncompleteProviderPullRequestFilesError)
+                or get_settings().config.get("propagate_tool_errors", False)
+            ):
                 raise
         finally:
             if progress_comment is not None:
@@ -213,7 +227,7 @@ class PRGenerateLabels:
             field = ".".join(str(part) for part in first_error["loc"]) or "$"
             raise FallbackEligibleError(f"Invalid labels model output at {field}: {first_error['msg']}") from error
 
-    def _prepare_labels(self) -> List[str]:
+    def _prepare_labels(self) -> list[str]:
         pr_types = self.data["labels"].copy()
 
         # convert lowercase labels to original case
@@ -226,4 +240,4 @@ class PRGenerateLabels:
         except Exception as e:
             get_logger().error(f"Error converting labels to original case {self.pr_id}: {e}")
 
-        return pr_types
+        return filter_generated_labels(pr_types)

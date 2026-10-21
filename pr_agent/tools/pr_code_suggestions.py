@@ -7,10 +7,10 @@ import textwrap
 import traceback
 from datetime import datetime
 from functools import partial
-from typing import Dict, List, Optional
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+from pr_agent.algo.artifacts import get_artifact_context
 from pr_agent.algo.code_replacement import python_replacement_compiles, reindent_to_line
 from pr_agent.algo.comment_identity import (
     PRCodeSuggestionsHeader,
@@ -20,13 +20,16 @@ from pr_agent.algo.comment_identity import (
     format_pr_code_suggestions_header,
     hidden_marker_forms,
 )
-from pr_agent.algo.git_patch_processing import decouple_and_convert_to_hunks_with_lines_numbers
+from pr_agent.algo.git_patch_processing import decouple_and_convert_to_hunks_with_lines_numbers, split_diff_lines
 from pr_agent.algo.pr_processing import (
+    DELETED_FILES_,
     OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD,
     OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
     FallbackEligibleError,
+    _append_metadata_section,
     _get_all_models,
     add_ai_metadata_to_diff_files,
+    append_filtered_file_names,
     get_effective_fallback_chain,
     get_pr_diff,
     get_pr_multi_diffs,
@@ -37,21 +40,38 @@ from pr_agent.algo.repo_context import build_repo_context
 from pr_agent.algo.run_details import init_run_details, record_command_failure, record_model_used
 from pr_agent.algo.run_output import push_outputs, show_relevant_configurations, show_run_details
 from pr_agent.algo.skills_loader import get_skills_context
-from pr_agent.algo.token_budget import AttemptTokenBudget, clip_tokens
+from pr_agent.algo.token_budget import AttemptTokenBudget, FittedPrompt
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import (
     ModelType,
     get_model,
+    get_suggestion_fence,
     load_yaml,
     replace_code_tags,
 )
 from pr_agent.config_loader import get_settings, get_verbosity_level
 from pr_agent.git_providers import get_git_provider_with_context
-from pr_agent.git_providers.git_provider import GitProvider, IncrementalPR, get_main_pr_language
+from pr_agent.git_providers.git_provider import (
+    GitProvider,
+    IncompleteProviderPullRequestFilesError,
+    IncrementalPR,
+    get_main_pr_language,
+)
 from pr_agent.log import get_logger
 from pr_agent.servers.help import HelpMessage
 from pr_agent.tools.pr_description import insert_br_after_x_chars
-from pr_agent.tools.progress_comment import build_progress_comment
+from pr_agent.tools.progress_comment import (
+    ChunkProgressReporter,
+    build_progress_comment,
+    edit_comment_safely,
+    supports_editable_progress_comment,
+)
+
+# TODO: in 1.0, remove the deprecated "commitable_code_suggestions" fallback in
+# get_committable_code_suggestions() below, its entry in
+# config_security.PER_DIRECTORY_HOST_ONLY_KEYS_BY_SECTION, and the deprecation note in
+# docs/docs/tools/improve.mdx. The flag guards the one-off warning it emits.
+_deprecated_spellings_warned = False
 
 
 def _as_threshold(setting_name: str, default: int, minimum: int) -> int:
@@ -70,6 +90,84 @@ def get_suggestions_score_threshold() -> int:
 
 def get_dual_publishing_score_threshold() -> int:
     return _as_threshold("pr_code_suggestions.dual_publishing_score_threshold", 0, 0)
+
+
+_REFLECTION_FAILURE_SCORE_WHY = "Self-reflection unavailable; score not model-assigned"
+
+
+def get_reflection_failure_score() -> int:
+    """Score for suggestions the model never vetted because self-reflection was unavailable.
+
+    Clamped at 0 and defaults to 7 so a malformed value cannot fail the run. Setting it below
+    pr_code_suggestions.suggestions_score_threshold drops those unvetted suggestions.
+    """
+    return _as_threshold("pr_code_suggestions.score_on_reflection_failure", 7, 0)
+
+
+def apply_reflection_failure_score(suggestions: list[dict]) -> None:
+    """Assign the configured fallback score and mark it as not model-assigned."""
+    score = get_reflection_failure_score()
+    for suggestion in suggestions:
+        suggestion["score"] = score
+        suggestion["score_why"] = _REFLECTION_FAILURE_SCORE_WHY
+
+
+def filter_suggestions_by_score_threshold(suggestions: list[dict], call_index: int = 0) -> list[dict]:
+    """Keep suggestions scored at or above pr_code_suggestions.suggestions_score_threshold.
+
+    A suggestion whose score cannot be read is dropped, as before.
+    """
+    score_threshold = get_suggestions_score_threshold()
+    kept = []
+    for i, suggestion in enumerate(suggestions):
+        try:
+            score = int(suggestion.get("score", 1))
+        except Exception as e:
+            get_logger().error(
+                f"Error getting PR diff for suggestion {i} in call {call_index}, error: {e}",
+                artifact={"prediction": suggestion})
+            continue
+        if score >= score_threshold:
+            kept.append(suggestion)
+        else:
+            get_logger().info(
+                f"Removing suggestions {i} from call {call_index}, because score is {score}, "
+                f"and score_threshold is {score_threshold}",
+                artifact=suggestion)
+    return kept
+
+
+def get_committable_code_suggestions() -> bool:
+    """Whether suggestions publish as committable inline comments.
+
+    ``commitable_code_suggestions`` was the public key from v0.22 until the pre-1.0 typo fix, so
+    it stays readable as a deprecated fallback: existing ``.pr_agent.toml`` files and pasted
+    ``/improve`` overrides keep working instead of silently reverting to table output.
+
+    The mode is enabled when *either* spelling is true, so the one set to true takes priority:
+    the canonical key wins when it is true, and a stale deprecated alias still enables the mode
+    when the canonical key is false. The canonical key cannot override the alias to false
+    because its default in configuration.toml is also false, leaving "unset" indistinguishable
+    from an explicit false after the settings merge; making the canonical key win outright
+    would silently disable every configuration that only sets the deprecated spelling.
+    """
+    global _deprecated_spellings_warned
+    # Either spelling set to true enables the mode, so whichever is true takes priority: check
+    # the canonical key first, then fall back to the deprecated alias.
+    if get_settings().pr_code_suggestions.committable_code_suggestions:
+        return True
+    # The deprecated key is absent from configuration.toml, so read it with a default instead of
+    # attribute access. Both spellings are spelled out literally so the dead-key ledger in
+    # tests/unittest/test_config_dead_keys.py can still see the canonical reader.
+    deprecated = bool(get_settings().pr_code_suggestions.get("commitable_code_suggestions", False))
+    # The caller may sit in a per-suggestion loop, so report the deprecated spelling only once.
+    if deprecated and not _deprecated_spellings_warned:
+        _deprecated_spellings_warned = True
+        get_logger().warning(
+            "pr_code_suggestions.commitable_code_suggestions is deprecated and will be removed in "
+            "1.0; rename it to pr_code_suggestions.committable_code_suggestions"
+        )
+    return deprecated
 
 
 def _markdown_code_span(text: str) -> str:
@@ -109,6 +207,9 @@ def render_suggestions_markdown(data: dict) -> str:
         summary = str(suggestion.get("one_sentence_summary") or suggestion.get("suggestion_content") or "").strip()
         if summary:
             lines.append(summary)
+        score_why = str(suggestion.get("score_why") or "").strip()
+        if score_why:
+            lines.append(f"Why: {score_why}")
         lines.append("")
     if not lines:
         return "## PR Code Suggestions\n\nNo suggestions to report."
@@ -129,20 +230,11 @@ def _supports_persistent_progress_comment(git_provider) -> bool:
     and can do neither; persisting the progress there would leak a stale "Preparing
     suggestions..." document ahead of the final result.
     """
-    return (git_provider.is_supported("edit_comment")
-            and git_provider.is_supported("remove_comment"))
+    return supports_editable_progress_comment(git_provider)
 
 
 def _edit_comment_safely(git_provider, comment, body: str) -> bool:
-    try:
-        result = git_provider.edit_comment(comment, body)
-    except Exception as error:
-        get_logger().warning(f"Failed to edit code suggestions comment: {error}")
-        return False
-    if result is False:
-        get_logger().warning("Failed to edit code suggestions comment")
-        return False
-    return True
+    return edit_comment_safely(git_provider, comment, body, label="code suggestions")
 
 
 class PRCodeSuggestions:
@@ -206,6 +298,7 @@ class PRCodeSuggestions:
             "diff_no_line_numbers": "",  # empty diff for initial calculation
             "num_code_suggestions": num_code_suggestions,
             "extra_instructions": get_settings().pr_code_suggestions.extra_instructions,
+            "artifact_context": get_artifact_context("pr_code_suggestions"),
             "skills_context": get_skills_context(),
             "repo_context": build_repo_context(self.git_provider),
             "suggestion_discussion_context": self._load_suggestion_discussion_context(),
@@ -235,6 +328,9 @@ class PRCodeSuggestions:
 
         self.progress = build_progress_comment()
         self.progress_response = None
+        # The body actually published above; chunk progress is appended to it in place.
+        self._progress_base_body = None
+        self._chunk_progress = None
 
     def _load_suggestion_discussion_context(self) -> str:
         if not _supports_code_suggestion_state(self.git_provider):
@@ -271,6 +367,8 @@ class PRCodeSuggestions:
     async def run(self):
         init_run_details()
         self._output_published = False
+        self._progress_base_body = None
+        self._chunk_progress = None
         try:
             if _supports_code_suggestion_state(self.git_provider):
                 try:
@@ -309,6 +407,7 @@ class PRCodeSuggestions:
                     # so it must already be a thread when threaded output is requested. Output-only
                     # providers (plain-diff) cannot edit or remove it afterwards, so for those the
                     # progress is a temporary placeholder that is never persisted.
+                    self._progress_base_body = self.progress
                     if _supports_persistent_progress_comment(self.git_provider):
                         self.progress_response = self.git_provider.publish_comment(self.progress,
                                                                                    **self._improve_thread_kwargs())
@@ -316,8 +415,13 @@ class PRCodeSuggestions:
                         self.progress_response = self.git_provider.publish_comment(
                             self.progress, is_temporary=True, **self._improve_thread_kwargs())
                 else:
+                    self._progress_base_body = "Preparing suggestions..."
                     self.progress_response = self.git_provider.publish_comment(
-                        "Preparing suggestions...", is_temporary=True)
+                        self._progress_base_body, is_temporary=True)
+            elif get_settings().config.publish_output_progress:
+                # No comment was published (an automatic command publishes none); the base
+                # body still anchors the reporter's dedup, so the check-run sink alone can serve.
+                self._progress_base_body = "Preparing suggestions..."
 
             # # call the model to get the suggestions, and self-reflect on them
             # if not self.is_extended:
@@ -463,17 +567,29 @@ class PRCodeSuggestions:
                                artifact={"traceback": traceback.format_exc()})
             if get_settings().config.publish_output:
                 if self.progress_response:
-                    self.git_provider.remove_comment(self.progress_response)
-                if not self._output_published:
+                    try:
+                        self.git_provider.remove_comment(self.progress_response)
+                    except Exception as cleanup_error:
+                        get_logger().exception(
+                            "Failed to remove code suggestions progress comment after an error, "
+                            f"error: {cleanup_error}"
+                        )
+                if (
+                    not isinstance(e, IncompleteProviderPullRequestFilesError)
+                    and not self._output_published
+                ):
                     try:
                         if not self.progress_response:
                             self.git_provider.remove_initial_comment()
                         self.git_provider.publish_comment("Failed to generate code suggestions for PR")
-                    except Exception as e:
-                        get_logger().exception(f"Failed to update persistent review, error: {e}")
+                    except Exception as publish_error:
+                        get_logger().exception(f"Failed to update persistent review, error: {publish_error}")
             # The status of the whole run must not read as success just because the error stopped here.
             record_command_failure()
-            if get_settings().config.get("propagate_tool_errors", False):
+            if (
+                isinstance(e, IncompleteProviderPullRequestFilesError)
+                or get_settings().config.get("propagate_tool_errors", False)
+            ):
                 raise
 
     async def add_self_review_text(self, pr_body):
@@ -492,7 +608,8 @@ class PRCodeSuggestions:
     def _get_suggestions_coverage_footer(self, suggestions_present: bool = True) -> str:
         failed_chunk_count = getattr(self, "failed_chunk_count", 0)
         remaining_files = getattr(self, "remaining_files_list", [])
-        if ((not failed_chunk_count and not remaining_files) or
+        partial_files = getattr(self, "partial_files_list", [])
+        if ((not failed_chunk_count and not remaining_files and not partial_files) or
                 not get_settings().pr_code_suggestions.get("enable_suggestions_coverage_footer", True)):
             return ""
         details = []
@@ -511,6 +628,14 @@ class PRCodeSuggestions:
                 file_list += f", and {extra_count} more"
             details.append(f"{len(remaining_files)} file(s) were not analyzed because of the token budget or "
                            f"maximum chunk calls: {file_list}.")
+        if partial_files:
+            displayed_files = partial_files[:50]
+            file_list = ", ".join(_markdown_code_span(name) for name in displayed_files)
+            extra_count = len(partial_files) - len(displayed_files)
+            if extra_count:
+                file_list += f", and {extra_count} more"
+            details.append(f"Partial input coverage: {len(partial_files)} file(s) had patches clipped before "
+                           f"analysis to fit the token budget: {file_list}.")
         return "\n\n⚠️ **Suggestion coverage:** " + " ".join(details)
 
     async def publish_no_suggestions(self):
@@ -625,11 +750,13 @@ class PRCodeSuggestions:
             return True
 
         def _publish_persistent_update_failure():
-            _clean_up_progress_note()
-            failure_body = (
-                f"⚠️ Failed to update the persistent {name} comment; "
-                f"the previous {name} remain unchanged."
+            record_command_failure()
+            failure_message = (
+                f"The persistent {name} update could not be confirmed. "
+                f"Check the existing {name} before retrying."
             )
+            _clean_up_progress_note(failure_message)
+            failure_body = f"⚠️ {failure_message}"
             try:
                 return git_provider.publish_comment(
                     failure_body,
@@ -801,9 +928,18 @@ class PRCodeSuggestions:
                         count = prev_suggestions.count(f"\n<details><summary>{name.capitalize()}")
                         count += prev_suggestions.count(f"\n<details><summary>✅ {name.capitalize()}")
                         if count >= max_previous_comments:
-                            # remove the oldest suggestion
-                            prev_suggestion_table = prev_suggestion_table[:prev_suggestion_table.rfind(
-                                f"<details><summary>{name.capitalize()} up to commit")]
+                            # remove the oldest suggestion. Entries gain a "✅ " prefix once they are
+                            # applied, so match both forms, the same way the count above does. An
+                            # unticked-only rfind() matches no entry when all of them are applied and
+                            # returns -1, which chops the closing tag; when a newer unticked entry is
+                            # present it matches that one instead and discards the whole history.
+                            oldest_entry = max(
+                                prev_suggestion_table.rfind(f"<details><summary>{name.capitalize()} up to commit"),
+                                prev_suggestion_table.rfind(
+                                    f"<details><summary>✅ {name.capitalize()} up to commit"),
+                            )
+                            if oldest_entry != -1:
+                                prev_suggestion_table = prev_suggestion_table[:oldest_entry]
 
                         tick = "✅ " if "✅" in latest_table else ""
                         # Add to the prev_suggestions section
@@ -888,6 +1024,23 @@ class PRCodeSuggestions:
         data = self.prediction
         return data
 
+    def _prepare_complete_suggestion_chunk(
+        self, budget: AttemptTokenBudget, numbered: str, unnumbered: str
+    ) -> FittedPrompt:
+        """Check a full chunk once; a truncated diff must never be treated as complete."""
+        variables = copy.deepcopy(self.vars)
+        variables["diff"] = numbered
+        variables["diff_no_line_numbers"] = unnumbered
+        system_prompt, user_prompt = budget.render_prompt_templates(variables)
+        prepared = budget.prepare_request(self.ai_handler, system_prompt, user_prompt)
+        if prepared.input_tokens > budget.input_token_limit(
+            OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD, preserve_minimum=True
+        ):
+            raise FallbackEligibleError(
+                f"The complete suggestion chunk does not fit the token limit for {budget.model}"
+            )
+        return prepared
+
     async def _get_prediction(self, model: str, patches_diff: str, patches_diff_no_line_number: str) -> dict:
         budget = getattr(self, "_suggestion_attempt_budget", None)
         if budget is None or budget.model != model:
@@ -905,23 +1058,9 @@ class PRCodeSuggestions:
             )
             self._suggestion_attempt_budget = budget
 
-        def render(diff_no_line_numbers: str) -> tuple[str, str]:
-            variables = copy.deepcopy(self.vars)
-            variables["diff"] = patches_diff
-            variables["diff_no_line_numbers"] = diff_no_line_numbers
-            return budget.render_prompt_templates(variables)
-
-        fitted = budget.fit_optional_text(
-            patches_diff_no_line_number,
-            render,
-            ai_handler=self.ai_handler,
-            default_output_tokens=OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD,
-            preserve_minimum=True,
+        fitted = self._prepare_complete_suggestion_chunk(
+            budget, patches_diff, patches_diff_no_line_number
         )
-        if fitted.optional_text != patches_diff_no_line_number:
-            raise FallbackEligibleError(
-                f"The complete suggestion chunk does not fit the token limit for {model}"
-            )
         system_prompt, user_prompt = fitted.system_prompt, fitted.user_prompt
         response, finish_reason = await self.ai_handler.chat_completion(
             model=model, temperature=get_settings().config.temperature, system=system_prompt, user=user_prompt)
@@ -937,14 +1076,14 @@ class PRCodeSuggestions:
         if response_reflect:
             await self.analyze_self_reflection_response(data, response_reflect)
         else:
-            get_logger().warning("Could not self-reflect on suggestions; using default score 7")
-            for suggestion in data["code_suggestions"]:
-                suggestion["score"] = 7
-                suggestion["score_why"] = ""
+            score_on_failure = get_reflection_failure_score()
+            get_logger().warning(
+                f"Could not self-reflect on suggestions; using score {score_on_failure}")
+            apply_reflection_failure_score(data["code_suggestions"])
 
         return data
 
-    async def _self_reflect_with_fallback(self, suggestion_list: List, patches_diff: str, model: str) -> str:
+    async def _self_reflect_with_fallback(self, suggestion_list: list, patches_diff: str, model: str) -> str:
         """Reflect over the reasoning models, returning the first non-empty response.
 
         self_reflect_on_suggestions swallows its errors and returns "", so an empty response is
@@ -983,15 +1122,17 @@ class PRCodeSuggestions:
         response_reflect_yaml = load_yaml(response_reflect)
         if not isinstance(response_reflect_yaml, dict):
             get_logger().warning(
-                "Self-reflection feedback was not a mapping; line anchors will not be resolved"
+                "Self-reflection feedback was not a mapping; applying the reflection-failure score"
             )
+            apply_reflection_failure_score(data["code_suggestions"])
             return
         code_suggestions_feedback = response_reflect_yaml.get("code_suggestions", [])
         if not isinstance(code_suggestions_feedback, list):
             get_logger().warning(
                 "Self-reflection feedback 'code_suggestions' was not a list; "
-                "line anchors will not be resolved"
+                "applying the reflection-failure score"
             )
+            apply_reflection_failure_score(data["code_suggestions"])
             return
         if code_suggestions_feedback and len(code_suggestions_feedback) == len(data["code_suggestions"]):
             for i, suggestion in enumerate(data["code_suggestions"]):
@@ -1027,8 +1168,7 @@ class PRCodeSuggestions:
                     get_logger().error(f"Error processing suggestion score {i}",
                                        artifact={"suggestion": suggestion,
                                                  "code_suggestions_feedback": code_suggestions_feedback[i]})
-                    suggestion["score"] = 7
-                    suggestion["score_why"] = ""
+                    apply_reflection_failure_score([suggestion])
 
                 suggestion = self.validate_one_liner_suggestion_not_repeating_code(suggestion)
 
@@ -1039,7 +1179,7 @@ class PRCodeSuggestions:
                             f"edited improved suggestion {i + 1}, because equal to existing code: "
                             f"{suggestion['existing_code']}"
                         )
-                        if get_settings().pr_code_suggestions.commitable_code_suggestions:
+                        if get_committable_code_suggestions():
                             suggestion['improved_code'] = ""  # we need 'existing_code' to locate the code in the PR
                         else:
                             suggestion['existing_code'] = ""
@@ -1048,8 +1188,9 @@ class PRCodeSuggestions:
         else:
             get_logger().warning(
                 f"Self-reflection feedback covered {len(code_suggestions_feedback)} suggestion(s) instead of "
-                f"{len(data['code_suggestions'])}; line anchors will not be resolved"
+                f"{len(data['code_suggestions'])}; applying the reflection-failure score"
             )
+            apply_reflection_failure_score(data["code_suggestions"])
 
     @staticmethod
     def _truncate_if_needed(suggestion):
@@ -1066,7 +1207,7 @@ class PRCodeSuggestions:
         return suggestion
 
     @staticmethod
-    def _parse_line_number(value) -> Optional[int]:
+    def _parse_line_number(value) -> int | None:
         """Convert an anchor value to an int, or None when it cannot be a line number.
 
         Rejects booleans, fractional floats (int() truncates them), and non-finite
@@ -1128,7 +1269,7 @@ class PRCodeSuggestions:
                                            'relevant_lines_end': relevant_lines_end})
             return False
         if diff_file.head_file and getattr(diff_file, "head_file_is_complete", True):
-            range_resolvable = relevant_lines_end <= len(diff_file.head_file.splitlines())
+            range_resolvable = relevant_lines_end <= len(split_diff_lines(diff_file.head_file))
         else:
             range_resolvable = self._get_patch_range_lines(
                 diff_file.patch, relevant_lines_start, relevant_lines_end) is not None
@@ -1140,7 +1281,7 @@ class PRCodeSuggestions:
             return False
         return True
 
-    def _prepare_pr_code_suggestions(self, predictions: str) -> Dict:
+    def _prepare_pr_code_suggestions(self, predictions: str) -> dict:
         data = load_yaml(predictions.strip(),
                          keys_fix_yaml=["relevant_file", "suggestion_content", "existing_code", "improved_code"],
                          first_key="code_suggestions", last_key="label")
@@ -1154,7 +1295,7 @@ class PRCodeSuggestions:
 
         # remove or edit invalid suggestions
         suggestion_list = []
-        one_sentence_summary_list = []
+        accepted_suggestion_keys = []
         for i, suggestion in enumerate(data['code_suggestions']):
             try:
                 needed_keys = ['one_sentence_summary', 'label', 'relevant_file']
@@ -1174,7 +1315,13 @@ class PRCodeSuggestions:
                     if CRITICAL_LABEL in suggestion['label'].lower():
                         suggestion['label'] = 'possible issue'
 
-                if suggestion['one_sentence_summary'] in one_sentence_summary_list:
+                file_key = self._suggestion_file_key(suggestion)
+                summary = suggestion['one_sentence_summary']
+                if any(
+                    (seen_summary is summary or seen_summary == summary)
+                    and (seen_file == file_key or not seen_file or not file_key)
+                    for seen_file, seen_summary in accepted_suggestion_keys
+                ):
                     get_logger().debug(f"Skipping suggestion {i + 1}, because it is a duplicate: {suggestion}")
                     continue
 
@@ -1186,7 +1333,9 @@ class PRCodeSuggestions:
 
                 if ('existing_code' in suggestion) and ('improved_code' in suggestion):
                     suggestion = self._truncate_if_needed(suggestion)
-                    one_sentence_summary_list.append(suggestion['one_sentence_summary'])
+                    accepted_suggestion_keys.append(
+                        (self._suggestion_file_key(suggestion), suggestion['one_sentence_summary'])
+                    )
                     suggestion_list.append(suggestion)
                 else:
                     get_logger().info(
@@ -1200,12 +1349,12 @@ class PRCodeSuggestions:
         return data
 
     @staticmethod
-    def _suggestion_file_key(suggestion: Dict) -> str:
+    def _suggestion_file_key(suggestion: dict) -> str:
         relevant_file = suggestion.get("relevant_file", "") if isinstance(suggestion, dict) else ""
         return relevant_file.strip() if isinstance(relevant_file, str) else ""
 
     @staticmethod
-    def _suggestion_score(suggestion: Dict) -> int:
+    def _suggestion_score(suggestion: dict) -> int:
         try:
             return int(suggestion.get("score", 0))
         except (AttributeError, TypeError, ValueError):
@@ -1213,11 +1362,11 @@ class PRCodeSuggestions:
 
     def _uses_summarized_output(self) -> bool:
         return not get_settings().config.publish_output or (
-            not get_settings().pr_code_suggestions.commitable_code_suggestions
+            not get_committable_code_suggestions()
             and self.git_provider.is_supported("gfm_markdown")
         )
 
-    def _limit_suggestions_per_file(self, suggestions: List[Dict]) -> List[Dict]:
+    def _limit_suggestions_per_file(self, suggestions: list[dict]) -> list[dict]:
         raw_limit = get_settings().get("pr_code_suggestions.max_suggestions_per_file", 0)
         try:
             max_suggestions_per_file = int(raw_limit)
@@ -1327,13 +1476,14 @@ class PRCodeSuggestions:
             score = d.get("score")
             header = f"**Suggestion:** {content} [{label}, importance: {score}]" if score \
                 else f"**Suggestion:** {content} [{label}]"
+            fence = get_suggestion_fence(new_code_snippet or "")
             if new_code_snippet and is_applicable:
-                body = f"{header}\n```suggestion\n" + new_code_snippet + "\n```"
+                body = f"{header}\n{fence}suggestion\n" + new_code_snippet + f"\n{fence}"
             else:
                 body = header
                 if new_code_snippet:
                     body += (f"\n\nProposed code (not offered as a committable change because {fallback_reason}):\n"
-                             f"```\n{new_code_snippet}\n```")
+                             f"{fence}\n{new_code_snippet}\n{fence}")
                 elif requires_pr_fallback:
                     body += f"\n\nNot offered as a committable change because {fallback_reason}."
 
@@ -1430,7 +1580,7 @@ class PRCodeSuggestions:
         relevant_lines_start: int,
         relevant_lines_end: int,
         new_code_snippet: str,
-    ) -> Optional[bool]:
+    ) -> bool | None:
         """Return False only when a verified replacement makes valid Python fail compilation."""
         if not relevant_file.lower().endswith((".py", ".pyi", ".pyw")):
             return None
@@ -1444,11 +1594,11 @@ class PRCodeSuggestions:
                                            relevant_lines_end, new_code_snippet)
 
     @staticmethod
-    def _get_patch_range_lines(patch, relevant_lines_start, relevant_lines_end) -> Optional[List[str]]:
+    def _get_patch_range_lines(patch, relevant_lines_start, relevant_lines_end) -> list[str] | None:
         target_lines = {}
         target_line = None
         target_remaining = 0
-        for line in (patch or "").splitlines():
+        for line in split_diff_lines(patch or ""):
             hunk_match = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
             if hunk_match:
                 target_line = int(hunk_match.group(1))
@@ -1476,7 +1626,7 @@ class PRCodeSuggestions:
         if diff_file is None:
             return False, "the file content is unavailable", False
         if diff_file.head_file and getattr(diff_file, "head_file_is_complete", True):
-            file_lines = diff_file.head_file.splitlines()
+            file_lines = split_diff_lines(diff_file.head_file)
             if relevant_lines_end > len(file_lines):
                 return False, "the anchored range is outside the file", False
             anchored_lines = file_lines[relevant_lines_start - 1:relevant_lines_end]
@@ -1515,7 +1665,7 @@ class PRCodeSuggestions:
             for file in self.diff_files:
                 if file.filename.strip() == relevant_file:
                     if file.head_file and getattr(file, "head_file_is_complete", True):
-                        file_lines = file.head_file.splitlines()
+                        file_lines = split_diff_lines(file.head_file)
                         if relevant_lines_start > len(file_lines):
                             get_logger().warning(
                                 "Could not dedent code snippet, because relevant_lines_start is out of range",
@@ -1572,7 +1722,7 @@ class PRCodeSuggestions:
 
         return suggestion
 
-    def remove_line_numbers(self, patches_diff_list: List[str]) -> List[str]:
+    def remove_line_numbers(self, patches_diff_list: list[str]) -> list[str]:
         # create a copy of the patches_diff_list, without line numbers for '__new hunk__' sections
         try:
             self.patches_diff_list_no_line_numbers = []
@@ -1597,14 +1747,14 @@ class PRCodeSuggestions:
     async def _predict_chunks(self, model: str, chunk_pairs: list) -> list:
         if get_settings().pr_code_suggestions.parallel_calls:
             results = await asyncio.gather(
-                *[self._get_prediction(model, numbered, unnumbered) for numbered, unnumbered in chunk_pairs],
+                *[self._predict_chunk(model, numbered, unnumbered) for numbered, unnumbered in chunk_pairs],
                 return_exceptions=True,
             )
         else:
             results = []
             for numbered, unnumbered in chunk_pairs:
                 try:
-                    results.append(await self._get_prediction(model, numbered, unnumbered))
+                    results.append(await self._predict_chunk(model, numbered, unnumbered))
                 except Exception as error:
                     results.append(error)
         for result in results:
@@ -1612,7 +1762,36 @@ class PRCodeSuggestions:
                 raise result
         return results
 
-    def _recovery_chain(self, model: str, settings) -> Optional[tuple]:
+    async def _predict_chunk(self, model: str, numbered: str, unnumbered: str):
+        """Suggest one chunk, then advance the in-place progress comment it was published under."""
+        try:
+            return await self._get_prediction(model, numbered, unnumbered)
+        finally:
+            progress = getattr(self, "_chunk_progress", None)
+            if progress is not None:
+                await progress.record_settled()
+
+    def _chunk_progress_reporter(self, total: int) -> ChunkProgressReporter | None:
+        """Report chunk progress by appending a line to the published progress comment in place.
+
+        A chunked run makes several model calls that can take minutes, so the placeholder stays
+        current. Returns None when no editable progress comment was published, or when the diff
+        yielded a single chunk, which has no progress worth an extra provider write. Both leave
+        the run with today's frozen placeholder.
+        """
+        base_body = getattr(self, "_progress_base_body", None)
+        if not base_body or total < 2:
+            return None
+        return ChunkProgressReporter.create(
+            self.git_provider,
+            self.progress_response,
+            base_body,
+            total=total,
+            body_builder=lambda line: f"{base_body}\n\n{line}",
+            label="code suggestions",
+        )
+
+    def _recovery_chain(self, model: str, settings) -> tuple | None:
         """Return the invocation-local fallback chain and current position after routing.
 
         The outer retry_with_fallback_models wrapper replaces the configured primary
@@ -1684,39 +1863,26 @@ class PRCodeSuggestions:
                     )
                     for index in pending:
                         numbered, unnumbered = chunk_pairs[index]
-
-                        def render(candidate: str) -> tuple[str, str]:
-                            variables = copy.deepcopy(self.vars)
-                            variables["diff"] = numbered
-                            variables["diff_no_line_numbers"] = candidate
-                            return attempt_budget.render_prompt_templates(variables)
-
                         try:
-                            fitted = attempt_budget.fit_optional_text(
-                                unnumbered,
-                                render,
-                                ai_handler=self.ai_handler,
-                                default_output_tokens=OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD,
-                                preserve_minimum=True,
-                            )
+                            self._prepare_complete_suggestion_chunk(attempt_budget, numbered, unnumbered)
                         except ValueError:
                             get_logger().warning(
                                 f"Skipping recovery of chunk {index + 1} with {fallback_model}: "
-                                "the required prompt exceeds its token budget"
+                                "the complete diff exceeds its token budget"
                             )
-                        else:
-                            if fitted.optional_text != unnumbered:
-                                get_logger().warning(
-                                    f"Skipping recovery of chunk {index + 1} with {fallback_model}: "
-                                    "the complete diff does not fit its token budget"
-                                )
-                                continue
-                            eligible.append(index)
+                            continue
+                        eligible.append(index)
                 except Exception as error:
                     get_logger().warning(f"Cannot prepare chunk recovery with {fallback_model}: {error}")
                     continue
                 if not eligible:
                     continue
+                # Each round is extra work on top of the batch already reported as done, and a
+                # chunk dropped for token budget never settles, so only extend for the chunks
+                # actually about to be retried.
+                progress = getattr(self, "_chunk_progress", None)
+                if progress is not None:
+                    await progress.extend_total(len(eligible))
                 # Sibling calls have finished before the deployment switch above.
                 recovered = await self._predict_chunks(fallback_model, [chunk_pairs[index] for index in eligible])
                 for index, result in zip(eligible, recovered, strict=True):
@@ -1742,6 +1908,14 @@ class PRCodeSuggestions:
         self.total_chunk_count = 0
         self.parse_failure_count = 0
         self.remaining_files_list = []
+        self.partial_files_list = []
+        # Each attempt owns a fresh reporter, so restore the placeholder before the next model
+        # prepares its chunks; otherwise the previous attempt's "N of N" line stays on screen
+        # until the new one settles its first chunk and rewinds it to 1.
+        previous_progress = getattr(self, "_chunk_progress", None)
+        self._chunk_progress = None
+        if previous_progress is not None:
+            await previous_progress.reset_to_base()
         output_token_reserve = getattr(self.ai_handler, "get_output_token_reserve", None)
         attempt_variables = copy.deepcopy(self.vars)
         attempt_variables["diff"] = ""
@@ -1761,21 +1935,26 @@ class PRCodeSuggestions:
         )
         attempt_token_handler = self._suggestion_attempt_budget.token_handler
         # get PR diff
+        deleted_files = []
         if get_settings().pr_code_suggestions.decouple_hunks:
-            self.patches_diff_list, self.remaining_files_list = get_pr_multi_diffs(
+            packed_diffs = get_pr_multi_diffs(
                 self.git_provider, attempt_token_handler, model,
                 max_calls=get_settings().pr_code_suggestions.max_number_of_calls,
-                add_line_numbers=True, return_remaining_files=True,
-                output_token_reserve=output_token_reserve)  # decouple hunk with line numbers
+                add_line_numbers=True, return_coverage=True,
+                output_token_reserve=output_token_reserve,
+                include_filtered_file_names=False, deleted_files=deleted_files)  # decouple hunk with line numbers
+            self.patches_diff_list = packed_diffs.chunks
             self.patches_diff_list_no_line_numbers = self.remove_line_numbers(self.patches_diff_list)  # decouple hunk
 
         else:
             # non-decoupled hunks
-            self.patches_diff_list_no_line_numbers, self.remaining_files_list = get_pr_multi_diffs(
+            packed_diffs = get_pr_multi_diffs(
                 self.git_provider, attempt_token_handler, model,
                 max_calls=get_settings().pr_code_suggestions.max_number_of_calls,
-                add_line_numbers=False, return_remaining_files=True,
-                output_token_reserve=output_token_reserve)
+                add_line_numbers=False, return_coverage=True,
+                output_token_reserve=output_token_reserve,
+                include_filtered_file_names=False, deleted_files=deleted_files)
+            self.patches_diff_list_no_line_numbers = packed_diffs.chunks
             self.patches_diff_list = await self.convert_to_decoupled_with_line_numbers(
                 self.patches_diff_list_no_line_numbers,
                 model,
@@ -1783,12 +1962,43 @@ class PRCodeSuggestions:
             )
             if not self.patches_diff_list:
                 # fallback to decoupled hunks
-                self.patches_diff_list, self.remaining_files_list = get_pr_multi_diffs(
+                deleted_files.clear()
+                packed_diffs = get_pr_multi_diffs(
                     self.git_provider, attempt_token_handler, model,
                     max_calls=get_settings().pr_code_suggestions.max_number_of_calls,
-                    add_line_numbers=True, return_remaining_files=True,
-                    output_token_reserve=output_token_reserve)  # decouple hunk with line numbers
+                    add_line_numbers=True, return_coverage=True,
+                    output_token_reserve=output_token_reserve,
+                    include_filtered_file_names=False, deleted_files=deleted_files)  # decouple hunk with line numbers
+                self.patches_diff_list = packed_diffs.chunks
                 self.patches_diff_list_no_line_numbers = self.remove_line_numbers(self.patches_diff_list)
+
+        self.remaining_files_list = packed_diffs.remaining_files_list
+        self.partial_files_list = packed_diffs.partial_files_list
+
+        filtered_files = getattr(self.git_provider, "get_filtered_diff_file_names", lambda: [])()
+        if self.patches_diff_list and isinstance(filtered_files, (list, tuple)) and filtered_files:
+            max_tokens = attempt_token_handler.prompt_tokens + self._suggestion_attempt_budget.available_tokens(
+                OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD, preserve_minimum=True, clamp=False,
+            )
+            self.patches_diff_list = [
+                append_filtered_file_names(chunk, self.git_provider, attempt_token_handler, max_tokens)
+                for chunk in self.patches_diff_list
+            ]
+            self.patches_diff_list_no_line_numbers = [
+                append_filtered_file_names(chunk, self.git_provider, attempt_token_handler, max_tokens)
+                for chunk in self.patches_diff_list_no_line_numbers
+            ]
+        if self.patches_diff_list and deleted_files:
+            max_tokens = attempt_token_handler.prompt_tokens + self._suggestion_attempt_budget.available_tokens(
+                OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD, preserve_minimum=True, clamp=False,
+            )
+            section = DELETED_FILES_ + "\n" + "\n".join(deleted_files)
+            for diffs in (self.patches_diff_list, self.patches_diff_list_no_line_numbers):
+                diffs[0] = _append_metadata_section(
+                    diffs[0], attempt_token_handler.prompt_tokens + attempt_token_handler.count_tokens(diffs[0]),
+                    section, max_tokens, attempt_token_handler, whole_lines=True)[0]
+        elif not self.patches_diff_list and not self.remaining_files_list and not self.partial_files_list:
+            return {"code_suggestions": []}
 
         if self.patches_diff_list:
             get_logger().info(f"Number of PR chunk calls: {len(self.patches_diff_list)}")
@@ -1799,6 +2009,7 @@ class PRCodeSuggestions:
             chunk_pairs = list(
                 zip(self.patches_diff_list, self.patches_diff_list_no_line_numbers, strict=True))
             self.total_chunk_count = len(chunk_pairs)
+            self._chunk_progress = self._chunk_progress_reporter(self.total_chunk_count)
 
             prediction_results = await self._predict_chunks(model, chunk_pairs)
             await self._recover_failed_chunks(model, chunk_pairs, prediction_results)
@@ -1813,6 +2024,8 @@ class PRCodeSuggestions:
                     prediction_list.append(prediction)
 
             self.failed_chunk_count = len(chunk_errors) + self.parse_failure_count
+            if self._chunk_progress is not None:
+                await self._chunk_progress.set_failed(self.failed_chunk_count)
             if chunk_errors and not prediction_list:
                 raise chunk_errors[0]
             self.prediction_list = prediction_list
@@ -1820,20 +2033,8 @@ class PRCodeSuggestions:
             data = {"code_suggestions": []}
             for j, predictions in enumerate(prediction_list):  # each call adds an element to the list
                 if "code_suggestions" in predictions:
-                    score_threshold = get_suggestions_score_threshold()
-                    for i, prediction in enumerate(predictions["code_suggestions"]):
-                        try:
-                            score = int(prediction.get("score", 1))
-                            if score >= score_threshold:
-                                data["code_suggestions"].append(prediction)
-                            else:
-                                get_logger().info(
-                                    f"Removing suggestions {i} from call {j}, because score is {score}, "
-                                    f"and score_threshold is {score_threshold}",
-                                    artifact=prediction)
-                        except Exception as e:
-                            get_logger().error(f"Error getting PR diff for suggestion {i} in call {j}, error: {e}",
-                                               artifact={"prediction": prediction})
+                    data["code_suggestions"].extend(
+                        filter_suggestions_by_score_threshold(predictions["code_suggestions"], j))
             data["code_suggestions"] = self._limit_suggestions_per_file(data["code_suggestions"])
             self.data = data
         else:
@@ -1847,7 +2048,7 @@ class PRCodeSuggestions:
         model,
         *,
         attempt_budget: AttemptTokenBudget | None = None,
-    ) -> List[str]:
+    ) -> list[str]:
         with get_logger().contextualize(sub_feature='convert_to_decoupled_with_line_numbers'):
             try:
                 if attempt_budget is None:
@@ -1884,20 +2085,10 @@ class PRCodeSuggestions:
                     token_count = attempt_budget.count_tokens(patch_final)
                     if token_count > max_input_tokens:
                         get_logger().warning(
-                            f"Token count {token_count} exceeds the limit {max_input_tokens}. clipping the tokens")
-                        add_truncation_marker = True
-                        while patch_final and token_count > max_input_tokens:
-                            clipped_patch = clip_tokens(
-                                patch_final,
-                                max_input_tokens,
-                                add_three_dots=add_truncation_marker,
-                                num_input_tokens=token_count,
-                            )
-                            add_truncation_marker = False
-                            if len(clipped_patch) >= len(patch_final):
-                                clipped_patch = patch_final[:len(patch_final) // 2]
-                            patch_final = clipped_patch
-                            token_count = attempt_budget.count_tokens(patch_final)
+                            f"Token count {token_count} exceeds the limit {max_input_tokens}. "
+                            "Repacking numbered chunks to preserve matching generation and reflection inputs."
+                        )
+                        return []
                     patches_diff_list.append(patch_final)
                 return patches_diff_list
             except Exception:
@@ -1907,7 +2098,7 @@ class PRCodeSuggestions:
                 })
                 return []
 
-    def generate_summarized_suggestions(self, data: Dict) -> str:
+    def generate_summarized_suggestions(self, data: dict) -> str:
         try:
             pr_body = f"{format_pr_code_suggestions_header()}\n\n"
 
@@ -1953,12 +2144,11 @@ class PRCodeSuggestions:
 
             # sort suggestions_labels by the suggestion with the highest score
             suggestions_labels = dict(
-                sorted(suggestions_labels.items(), key=lambda x: max([s['score'] for s in x[1]]), reverse=True))
+                sorted(suggestions_labels.items(), key=lambda x: max(s['score'] for s in x[1]), reverse=True))
             # sort the suggestions inside each label group by score
             for label, suggestions in suggestions_labels.items():
                 suggestions_labels[label] = sorted(suggestions, key=lambda x: x['score'], reverse=True)
 
-            counter_suggestions = 0
             for label, suggestions in suggestions_labels.items():
                 num_suggestions = len(suggestions)
                 pr_body += f"""<tr><td rowspan={num_suggestions}>{label.capitalize()}</td>\n"""
@@ -1967,7 +2157,6 @@ class PRCodeSuggestions:
                     relevant_file = suggestion['relevant_file'].strip()
                     relevant_lines_start = int(suggestion['relevant_lines_start'])
                     relevant_lines_end = int(suggestion['relevant_lines_end'])
-                    range_str = ""
                     if relevant_lines_start == relevant_lines_end:
                         range_str = f"[{relevant_lines_start}]"
                     else:
@@ -1976,7 +2165,7 @@ class PRCodeSuggestions:
                     try:
                         code_snippet_link = self.git_provider.get_line_link(relevant_file, relevant_lines_start,
                                                                             relevant_lines_end)
-                    except:
+                    except (AttributeError, KeyError, ValueError):
                         code_snippet_link = ""
                     # add html table for each suggestion
 
@@ -2036,15 +2225,19 @@ class PRCodeSuggestions:
                     pr_body += f"</td><td align=center>{score_str}\n\n"
 
                     pr_body += "</td></tr>"
-                    counter_suggestions += 1
 
                 # pr_body += "</details>"
                 # pr_body += """</td></tr>"""
             pr_body += """</tr></tbody></table>"""
             return pr_body
         except Exception as e:
-            get_logger().info(f"Failed to publish summarized code suggestions, error: {e}")
-            return ""
+            # Returning "" here is not a safe "no suggestions" answer: the caller appends the
+            # coverage footer and then overwrites the persistent review, so a swallowed
+            # rendering error would replace the existing suggestion table with a footer-only
+            # body and demote the real table into history. Fail loudly instead, the way
+            # PRReviewer._prepare_pr_review does, so the run reports a failure.
+            get_logger().exception(f"Failed to publish summarized code suggestions, error: {e}")
+            raise ValueError("Failed to generate summarized code suggestions") from e
 
     def get_score_str(self, score: int) -> str:
         th_high = get_settings().pr_code_suggestions.get('new_score_mechanism_th_high', 9)
@@ -2057,7 +2250,7 @@ class PRCodeSuggestions:
             return "Low"
 
     async def self_reflect_on_suggestions(self,
-                                          suggestion_list: List,
+                                          suggestion_list: list,
                                           patches_diff: str,
                                           model: str,
                                           prev_suggestions_str: str = "",
@@ -2076,6 +2269,8 @@ class PRCodeSuggestions:
                          "diff": patches_diff,
                          'num_code_suggestions': len(suggestion_list),
                          'prev_suggestions_str': prev_suggestions_str,
+                         'extra_instructions': getattr(self, 'vars', {}).get('extra_instructions') or '',
+                         'artifact_context': (getattr(self, 'vars', {}) or {}).get('artifact_context') or None,
                          "is_ai_metadata": is_ai_metadata,
                          "diff_hunk_format": render_diff_hunk_format(
                              include_line_numbers=True,
